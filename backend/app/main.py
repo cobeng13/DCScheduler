@@ -5,7 +5,9 @@ import csv
 import io
 import json
 import mimetypes
+import os
 import shutil
+import sqlite3
 import sys
 from pathlib import Path
 from uuid import uuid4
@@ -414,12 +416,36 @@ def export_faculty_load(faculty: str, db: Session = Depends(get_db)):
 def import_database(file: UploadFile = File(...)):
     target = DATABASE_PATH
     temp_path = target.with_suffix(".upload")
-    with temp_path.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    shutil.move(str(temp_path), target)
-    with SessionLocal() as db:
+    try:
+        with temp_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        try:
+            uploaded_db = sqlite3.connect(temp_path)
+            try:
+                integrity = uploaded_db.execute("PRAGMA integrity_check").fetchone()
+                if not integrity or integrity[0] != "ok":
+                    raise sqlite3.DatabaseError("SQLite integrity check failed")
+                schedule_table = uploaded_db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schedule_entries'"
+                ).fetchone()
+                if not schedule_table:
+                    raise sqlite3.DatabaseError("Missing schedule_entries table")
+            finally:
+                uploaded_db.close()
+        except sqlite3.DatabaseError as exc:
+            raise HTTPException(status_code=400, detail="The selected file is not a valid timetable database") from exc
+
+        # On Unix/macOS, open SQLite connections continue pointing at the old inode
+        # after a file replacement. Close the pool before and after the atomic swap.
+        engine.dispose()
+        os.replace(temp_path, target)
+        engine.dispose()
         models.Base.metadata.create_all(bind=engine)
-        crud.remove_unused_placeholder_entities(db)
+        with SessionLocal() as db:
+            crud.remove_unused_placeholder_entities(db)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
     return {"ok": True}
 
 

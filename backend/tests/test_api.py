@@ -84,6 +84,24 @@ def test_reports_and_conflicts_endpoints():
     assert "Faculty Load" in response.text
 
 
+def test_database_export_import_round_trip_and_rejects_invalid_file():
+    exported = client.get("/file/export")
+    assert exported.status_code == 200
+    imported = client.post(
+        "/file/import",
+        files={"file": ("scheduler.db", exported.content, "application/x-sqlite3")},
+    )
+    assert imported.status_code == 200
+    assert client.get("/schedule").status_code == 200
+
+    invalid = client.post(
+        "/file/import",
+        files={"file": ("not-a-database.db", b"not sqlite", "application/octet-stream")},
+    )
+    assert invalid.status_code == 400
+    assert client.get("/schedule").status_code == 200
+
+
 def test_faculty_load_report_totals_lecture_and_lab():
     from app import reports
 

@@ -811,6 +811,7 @@ export default function App() {
   } | null>(null);
   const [isCsvImporting, setIsCsvImporting] = useState(false);
   const [csvInputKey, setCsvInputKey] = useState(0);
+  const [dbInputKey, setDbInputKey] = useState(0);
   const [curricula, setCurricula] = useState<Curriculum[]>([]);
   const [curriculumTerm, setCurriculumTerm] = useState<CurriculumTerm>("First Semester");
   const [curriculumPreview, setCurriculumPreview] = useState<{
@@ -2853,27 +2854,53 @@ export default function App() {
   const handleImportDb = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
-    const form = new FormData();
-    form.append("file", file);
-    await fetch(`${API_BASE}/file/import`, { method: "POST", body: form });
-    setUndoStack([]);
-    const loadedConflictIgnoreSettings = await loadSettingsFromServer();
-    await refreshAll(loadedConflictIgnoreSettings);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const response = await fetch(`${API_BASE}/file/import`, { method: "POST", body: form });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.detail ?? `Could not open timetable (${response.status})`);
+      }
+      setUndoStack([]);
+      const loadedConflictIgnoreSettings = await loadSettingsFromServer();
+      await refreshAll(loadedConflictIgnoreSettings);
+      setToast({ message: `Opened ${file.name}`, showRevert: false });
+    } catch (error) {
+      setToast({
+        message: error instanceof Error ? error.message : "Could not open timetable",
+        showRevert: false,
+      });
+    } finally {
+      setDbInputKey((prev) => prev + 1);
+    }
   };
 
   const handleImportCsvPreview = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
-    const form = new FormData();
-    form.append("file", file);
-    const res = await fetch(`${API_BASE}/file/import-csv?preview=true`, {
-      method: "POST",
-      body: form,
-    });
-    const summary = (await res.json()) as CsvImportSummary;
-    setCsvImportState({ file, summary });
-    setCsvInputKey((prev) => prev + 1);
-    setOpenMenu(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch(`${API_BASE}/file/import-csv?preview=true`, {
+        method: "POST",
+        body: form,
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.detail ?? `Could not read CSV (${res.status})`);
+      }
+      const summary = (await res.json()) as CsvImportSummary;
+      setCsvImportState({ file, summary });
+      setOpenMenu(null);
+    } catch (error) {
+      setToast({
+        message: error instanceof Error ? error.message : "Could not read CSV",
+        showRevert: false,
+      });
+    } finally {
+      setCsvInputKey((prev) => prev + 1);
+    }
   };
 
   const handleConfirmCsvImport = async () => {
@@ -2881,14 +2908,31 @@ export default function App() {
     setIsCsvImporting(true);
     const form = new FormData();
     form.append("file", csvImportState.file);
-    await fetch(`${API_BASE}/file/import-csv?replace=true`, {
-      method: "POST",
-      body: form,
-    });
-    setCsvImportState(null);
-    setIsCsvImporting(false);
-    setUndoStack([]);
-    refreshAll();
+    try {
+      const response = await fetch(`${API_BASE}/file/import-csv?replace=true`, {
+        method: "POST",
+        body: form,
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.detail ?? `Could not import CSV (${response.status})`);
+      }
+      const summary = (await response.json()) as CsvImportSummary;
+      if (summary.rows_imported === 0 && summary.rows_total > 0) {
+        throw new Error(summary.errors[0]?.reason ?? "No CSV rows could be imported");
+      }
+      setCsvImportState(null);
+      setUndoStack([]);
+      await refreshAll();
+      setToast({ message: `Imported ${summary.rows_imported} CSV rows`, showRevert: false });
+    } catch (error) {
+      setToast({
+        message: error instanceof Error ? error.message : "Could not import CSV",
+        showRevert: false,
+      });
+    } finally {
+      setIsCsvImporting(false);
+    }
   };
 
   const handleCancelCsvImport = () => {
@@ -3576,7 +3620,9 @@ export default function App() {
                   <label className="menu-item file-input">
                     Open Timetable
                     <input
+                      key={dbInputKey}
                       type="file"
+                      accept=".db,.sqlite,.sqlite3,application/x-sqlite3"
                       onChange={(event) => {
                         handleImportDb(event);
                         setOpenMenu(null);
