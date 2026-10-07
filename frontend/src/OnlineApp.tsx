@@ -4,7 +4,7 @@ import { Activity, configure, OnlineUser, Program, request } from "./online";
 import "./online.css";
 
 type Session = { user: OnlineUser; csrf_token: string };
-const fieldLabels: Record<string, string> = { name: "Name", username: "Username", assigned_user_id: "Assigned account", disabled: "Disabled", is_admin: "Administrator", must_change_password: "Password change required", curriculumState: "Curriculum" };
+const fieldLabels: Record<string, string> = { name: "Name", username: "Username", assigned_user_id: "Assigned account", disabled: "Disabled", is_admin: "Administrator", must_change_password: "Password change required", curriculumState: "Curriculum", ignoreRoom: "Ignore room conflicts", ignoreFaculty: "Ignore faculty conflicts" };
 const visibleFields = (event: Activity) => event.changed_fields.filter(field => field in fieldLabels || /^[A-Z#]/.test(field));
 
 export default function OnlineApp() {
@@ -20,10 +20,26 @@ export default function OnlineApp() {
   const [feedActor, setFeedActor] = useState("");
   const [security, setSecurity] = useState(false);
   const [adminOpen, setAdminOpen] = useState(false);
+  const [activityVisible, setActivityVisible] = useState(true);
   const [error, setError] = useState("");
   const [connected, setConnected] = useState(false);
   const active = programs.find(p => p.id === programId) ?? null;
   configure(session?.user ?? null, session?.csrf_token ?? "", active);
+
+  useEffect(() => {
+    if (!session) return;
+    try {
+      setActivityVisible(window.localStorage.getItem(`scheduler:activity-visible:${session.user.id}`) !== "false");
+    } catch { setActivityVisible(true); }
+  }, [session?.user.id]);
+  const toggleActivity = () => {
+    const next = !activityVisible;
+    setActivityVisible(next);
+    if (session) {
+      try { window.localStorage.setItem(`scheduler:activity-visible:${session.user.id}`, String(next)); }
+      catch { /* The toggle still works if browser storage is unavailable. */ }
+    }
+  };
 
   const loadPrograms = async () => {
     const next = await request<Program[]>("/programs");
@@ -110,17 +126,21 @@ export default function OnlineApp() {
       </select></label>
       <span>{canEdit ? "Editing enabled" : "Read-only"}</span>
       <span className={connected ? "connected" : "reconnecting"}>{connected ? "Live" : "Reconnecting…"}</span>
+      <button type="button" onClick={toggleActivity} aria-expanded={activityVisible} aria-controls="shared-activity"
+        title="Hide or show the activity panel. Schedules continue updating live.">
+        {activityVisible ? "Hide live updates" : "Show live updates"}
+      </button>
       <span>{session.user.username}</span>
       {session.user.is_admin && <button onClick={() => setAdminOpen(!adminOpen)}>Administration</button>}
       <button onClick={async () => { await request("/auth/logout", { method: "POST" }); signOut(); }}>Sign out</button>
     </header>
     {error && <div className="online-error" role="alert">{error} <button onClick={() => setError("")}>Dismiss</button></div>}
     {adminOpen && <AdminPanel programs={programs} reload={loadPrograms} onError={setError} />}
-    <div className="online-layout">
+    <div className={`online-layout${activityVisible ? "" : " activity-hidden"}`}>
       <div className="scheduler-workspace">
         {programs.length ? <App key={programId ?? "all"} readOnly={!canEdit} activeProgram={active?.name ?? ""} isAdmin={session.user.is_admin} /> : <div className="account-card">Create programs and accounts in Administration to begin.</div>}
       </div>
-      <aside className="activity-panel">
+      <aside id="shared-activity" className="activity-panel" hidden={!activityVisible}>
         <h2>Shared activity</h2>
         <p className="presence">Online: {online.map(u => u.username).join(", ") || "No active users"}</p>
         <input aria-label="Search activity" placeholder="Search activity…" value={search} onChange={e => setSearch(e.target.value)} />
@@ -199,6 +219,6 @@ function AdminPanel({ programs, reload, onError }: { programs: Program[]; reload
       <button onClick={() => run(() => request(`/admin/users/${u.id}`, { method: "PUT", body: JSON.stringify({ disabled: !u.disabled }) }))}>{u.disabled ? "Enable" : "Disable"}</button>
       <button onClick={() => { const password = window.prompt(`New initial password for ${u.username} (12+ characters). This revokes their sessions.`); if (password) run(() => request(`/admin/users/${u.id}`, { method: "PUT", body: JSON.stringify({ password }) })); }}>Reset password</button>
     </div>)}
-    <p>Room and faculty conflicts are blocked. Admin overrides require a reason; section conflicts cannot be overridden.</p>
+    <p>Use the Rules menu to turn room and faculty conflict checks on or off for everyone. Only admins can change these settings. A section cannot have two classes at the same time.</p>
   </section>;
 }

@@ -3617,7 +3617,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                       onChange={event => changeGlobalRule("ignoreRoom", event.target.checked)} />
                     Ignore room conflicts
                   </label>
-                  <p>Section overlaps are always blocked. TBA resources do not reserve a room or faculty member.</p>
+                  <p>A section cannot have two classes at the same time. TBA means no room or faculty is assigned yet.</p>
                   {isRulesSaving ? <p>Saving…</p> : null}
                 </div>
               ) : null}

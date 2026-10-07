@@ -3,6 +3,8 @@ body { margin: 0; }
 .online-header label { display:flex; align-items:center; gap:8px; }
 .online-header button,.online-header select { padding:7px; border-radius:5px; }
 .online-layout { display:grid; grid-template-columns:minmax(0,1fr) 310px; align-items:start; }
+.online-layout.activity-hidden { grid-template-columns:minmax(0,1fr); }
+.activity-panel[hidden] { display:none; }
 .scheduler-workspace { min-width:0; }
 .scheduler-workspace>.app { height:calc(100vh - 62px); min-height:650px; }
 .activity-panel { padding:16px; background:#f4f7fa; border-left:1px solid #d3dde5; height:calc(100vh - 90px); overflow:auto; position:sticky; top:0; }
