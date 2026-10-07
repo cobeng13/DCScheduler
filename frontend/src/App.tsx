@@ -1,3 +1,5 @@
+import { parseCurriculumCsv, normalizeSemester, curriculumTerms, curriculumIdForSection, coursesForSection } from "./curriculum";
+import type { Curriculum, CurriculumCourse, CurriculumState, CurriculumTerm } from "./curriculum";
 import html2canvas from "html2canvas";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { schedulerFetch as fetch, pinVersion, programName, snapshotVersions, withExpectedVersions, scopedStorage as localStorage } from "./online";
@@ -46,35 +48,6 @@ type CsvImportSummary = {
   rows_skipped: number;
   missing_columns: string[];
   errors: Array<{ row_index: number; reason: string }>;
-};
-
-type CurriculumTerm = "First Semester" | "Second Semester" | "Term Break";
-
-type CurriculumCourse = {
-  program: string;
-  yearLevel: string;
-  semester: CurriculumTerm;
-  courseCode: string;
-  courseDescription: string;
-  lecUnits: number;
-  labUnits: number;
-  totalUnits: number;
-  hours: number;
-};
-
-type Curriculum = {
-  id: string;
-  name: string;
-  sourceFileName: string;
-  importedAt: string;
-  courses: CurriculumCourse[];
-};
-
-type CurriculumState = {
-  curricula: Curriculum[];
-  selectedTerm: CurriculumTerm;
-  sectionYearLevels: Record<string, string>;
-  yearLevelCurriculumIds: Record<string, string>;
 };
 
 type CourseDescriptionConflict = {
@@ -150,6 +123,7 @@ const defaultCurriculumState: CurriculumState = {
   selectedTerm: "First Semester",
   sectionYearLevels: {},
   yearLevelCurriculumIds: {},
+  sectionCurriculumIds: {},
 };
 
 const defaultCustomizeSettings: CustomizeSettings = {
@@ -222,6 +196,7 @@ const normalizeCurriculumState = (
     state?.sectionYearLevels && typeof state.sectionYearLevels === "object"
       ? state.sectionYearLevels
       : {},
+  sectionCurriculumIds: state?.sectionCurriculumIds && typeof state.sectionCurriculumIds === "object" ? state.sectionCurriculumIds : {},
   yearLevelCurriculumIds:
     state?.yearLevelCurriculumIds && typeof state.yearLevelCurriculumIds === "object"
       ? state.yearLevelCurriculumIds
@@ -373,179 +348,6 @@ const compareYearLevels = (left: string, right: string) => {
     return leftRank - rightRank;
   }
   return left.localeCompare(right, undefined, { sensitivity: "base", numeric: true });
-};
-
-const curriculumTerms: CurriculumTerm[] = ["First Semester", "Second Semester", "Term Break"];
-
-const normalizeSemester = (value: string): CurriculumTerm | null => {
-  const cleaned = normalizeMatchValue(value);
-  if (["1st", "1st sem", "first sem", "first semester"].includes(cleaned)) {
-    return "First Semester";
-  }
-  if (["2nd", "2nd sem", "second sem", "second semester"].includes(cleaned)) {
-    return "Second Semester";
-  }
-  if (["term break", "term-break", "summer", "midyear"].includes(cleaned)) {
-    return "Term Break";
-  }
-  return curriculumTerms.find((term) => normalizeMatchValue(term) === cleaned) ?? null;
-};
-
-const calculateCurriculumHours = (
-  semester: CurriculumTerm,
-  lecUnits: number,
-  labUnits: number
-) => {
-  if (semester === "Term Break") {
-    return roundHours(lecUnits * 4.25);
-  }
-  return roundHours(lecUnits + labUnits * 3);
-};
-
-const parseCsvText = (text: string) => {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let cell = "";
-  let inQuotes = false;
-
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index];
-    const next = text[index + 1];
-    if (char === '"' && inQuotes && next === '"') {
-      cell += '"';
-      index += 1;
-    } else if (char === '"') {
-      inQuotes = !inQuotes;
-    } else if (char === "," && !inQuotes) {
-      row.push(cell);
-      cell = "";
-    } else if ((char === "\n" || char === "\r") && !inQuotes) {
-      if (char === "\r" && next === "\n") {
-        index += 1;
-      }
-      row.push(cell);
-      if (row.some((value) => value.trim())) {
-        rows.push(row);
-      }
-      row = [];
-      cell = "";
-    } else {
-      cell += char;
-    }
-  }
-
-  row.push(cell);
-  if (row.some((value) => value.trim())) {
-    rows.push(row);
-  }
-  return rows;
-};
-
-const parseCurriculumCsv = (text: string) => {
-  const rows = parseCsvText(text);
-  const headers = rows[0]?.map((header) => header.trim().toLowerCase()) ?? [];
-  const headerIndex = (name: string) => headers.indexOf(name.toLowerCase());
-  const indexes = {
-    program: headerIndex("Program"),
-    yearLevel: headerIndex("Year Level"),
-    semester: headerIndex("Semester"),
-    courseCode: headerIndex("Course Code"),
-    courseDescription: headerIndex("Course Description"),
-    lecLab: headerIndex("Lec/Lab"),
-    units: headerIndex("Units"),
-  };
-  const missingColumns = Object.entries(indexes)
-    .filter(([, index]) => index === -1)
-    .map(([name]) => name);
-  if (missingColumns.length > 0) {
-    throw new Error(`Missing curriculum columns: ${missingColumns.join(", ")}`);
-  }
-
-  type CurriculumCourseParts = {
-    program: string;
-    yearLevel: string;
-    semester: CurriculumTerm;
-    courseCode: string;
-    courseDescription: string;
-    lecUnits: number;
-    labUnits: number;
-  };
-
-  const coursesByKey = new Map<string, CurriculumCourseParts>();
-  rows.slice(1).forEach((row) => {
-    const semester = normalizeSemester(row[indexes.semester] ?? "");
-    const courseCode = (row[indexes.courseCode] ?? "").trim();
-    const courseDescription = (row[indexes.courseDescription] ?? "").trim();
-    if (!semester || !courseCode || !courseDescription) return;
-    const lecLab = normalizeMatchValue(row[indexes.lecLab] ?? "");
-    const units = Number((row[indexes.units] ?? "").trim());
-    const unitValue = Number.isFinite(units) ? units : 0;
-    const program = (row[indexes.program] ?? "").trim();
-    const yearLevel = (row[indexes.yearLevel] ?? "").trim();
-    const key = [
-      normalizeMatchValue(program),
-      normalizeMatchValue(yearLevel),
-      normalizeMatchValue(semester),
-      normalizeMatchValue(courseCode),
-      normalizeMatchValue(courseDescription),
-    ].join("|");
-    const existing =
-      coursesByKey.get(key) ??
-      {
-        program,
-        yearLevel,
-        semester,
-        courseCode,
-        courseDescription,
-        lecUnits: 0,
-        labUnits: 0,
-      };
-    if (lecLab.includes("lab")) {
-      existing.labUnits += unitValue;
-    } else {
-      existing.lecUnits += unitValue;
-    }
-    coursesByKey.set(key, existing);
-  });
-
-  const courses = [...coursesByKey.values()].flatMap((course) => {
-    const hasLec = course.lecUnits > 0;
-    const hasLab = course.labUnits > 0;
-    const hasBoth = hasLec && hasLab;
-    const entries: CurriculumCourse[] = [];
-
-    if (hasLec) {
-      entries.push({
-        ...course,
-        courseCode: hasBoth ? `${course.courseCode} LEC` : course.courseCode,
-        courseDescription: hasBoth
-          ? `${course.courseDescription} LEC`
-          : course.courseDescription,
-        lecUnits: course.lecUnits,
-        labUnits: 0,
-        totalUnits: roundHours(course.lecUnits),
-        hours: calculateCurriculumHours(course.semester, course.lecUnits, 0),
-      });
-    }
-
-    if (hasLab) {
-      entries.push({
-        ...course,
-        courseCode: `${course.courseCode} LAB`,
-        courseDescription: `${course.courseDescription} LAB`,
-        lecUnits: 0,
-        labUnits: course.labUnits,
-        totalUnits: roundHours(course.labUnits),
-        hours: calculateCurriculumHours(course.semester, 0, course.labUnits),
-      });
-    }
-
-    return entries;
-  });
-
-  return courses.sort((left, right) =>
-    left.courseCode.localeCompare(right.courseCode, undefined, { sensitivity: "base" })
-  );
 };
 
 const getEntryWeeklyHours = (entry: ScheduleEntry) => {
@@ -819,7 +621,9 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     fileName: string;
     name: string;
     courses: CurriculumCourse[];
-  } | null>(null);
+  }[] | null>(null);
+  const [isCurriculumSaving, setIsCurriculumSaving] = useState(false);
+  const [sectionCurriculumIds, setSectionCurriculumIds] = useState<Record<string, string>>({});
   const [curriculumInputKey, setCurriculumInputKey] = useState(0);
   const [sectionYearLevels, setSectionYearLevels] = useState<Record<string, string>>({});
   const [yearLevelCurriculumIds, setYearLevelCurriculumIds] = useState<Record<string, string>>(
@@ -870,8 +674,9 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       selectedTerm: curriculumTerm,
       sectionYearLevels,
       yearLevelCurriculumIds,
+      sectionCurriculumIds,
     }),
-    [curricula, curriculumTerm, sectionYearLevels, yearLevelCurriculumIds]
+    [curricula, curriculumTerm, sectionYearLevels, yearLevelCurriculumIds, sectionCurriculumIds]
   );
 
   const conflictIgnoreSettings = useMemo(
@@ -997,6 +802,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       selectedTerm,
       sectionYearLevels,
       yearLevelCurriculumIds: {},
+  sectionCurriculumIds: {},
     };
   };
 
@@ -1006,6 +812,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     setCurriculumTerm(normalized.selectedTerm);
     setSectionYearLevels(normalized.sectionYearLevels);
     setYearLevelCurriculumIds(normalized.yearLevelCurriculumIds);
+    setSectionCurriculumIds(normalized.sectionCurriculumIds);
   };
 
   const persistSettings = async (
@@ -1158,7 +965,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       window.clearTimeout(settingsSaveTimeout.current);
     }
     settingsSaveTimeout.current = window.setTimeout(() => {
-      persistSettings(customizeSettings, curriculumState);
+      persistSettings(customizeSettings, curriculumState).catch((error: Error) => setToast({ message: `Settings not saved: ${error.message}`, showRevert: false }));
     }, 300);
     return () => {
       if (settingsSaveTimeout.current) {
@@ -1415,13 +1222,10 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     return curriculumId ? getCurriculumById(curriculumId) : undefined;
   };
 
-  const getSectionCurriculumScope = (section: string) => {
-    const yearLevel = getSectionYearLevel(section);
-    return {
-      yearLevelKey: normalizeMatchValue(yearLevel),
-      curriculumId: yearLevel ? getYearLevelCurriculumId(yearLevel) : "",
-    };
-  };
+  const getSectionCurriculumScope = (section: string) => ({
+    yearLevelKey: normalizeMatchValue(getSectionYearLevel(section)),
+    curriculumId: curriculumIdForSection(section, curriculumState),
+  });
 
   const isSameCurriculumScope = (leftSection: string, rightSection: string) => {
     const left = getSectionCurriculumScope(leftSection);
@@ -1433,15 +1237,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   };
 
   const getCurriculumCoursesForSection = (section: string) => {
-    const yearLevel = getSectionYearLevel(section);
-    const assignedCurriculum = yearLevel ? getYearLevelCurriculum(yearLevel) : undefined;
-    const courses = assignedCurriculum?.courses ?? curriculumCourses;
-    const activeCourses = courses.filter((course) => course.semester === curriculumTerm);
-    if (!yearLevel) return activeCourses;
-    const yearLevelCourses = activeCourses.filter(
-      (course) => normalizeMatchValue(course.yearLevel) === normalizeMatchValue(yearLevel)
-    );
-    return yearLevelCourses.length > 0 ? yearLevelCourses : activeCourses;
+    return coursesForSection(curricula, curriculumTerm, section, curriculumState);
   };
 
   const getCurriculumCourse = (courseCode: string, section = "") => {
@@ -1525,6 +1321,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       });
     });
     entries.forEach((entry) => {
+      if (getSectionCurriculumScope(entry.Section).curriculumId) return;
       const code = entry["Course Code"].trim();
       const description = entry["Course Description"].trim();
       if (!code || !description) return;
@@ -1582,7 +1379,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
         left.localeCompare(right, undefined, { sensitivity: "base" })
       ),
     };
-  }, [activeCurriculumCourses, entries]);
+  }, [activeCurriculumCourses, entries, sectionCurriculumIds, sectionYearLevels, yearLevelCurriculumIds]);
 
   const formCourseCodeOptions = useMemo(() => {
     const curriculumCodes = getCurriculumCoursesForSection(scheduleForm.Section).map(
@@ -1749,7 +1546,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       return entries
         .filter(
           (entry) =>
-            normalizeMatchValue(entry["Course Code"]) === conflict.codeKey &&
+            Object.values(conflict.entryIdsByDescription).flat().includes(entry.id) &&
             entry["Course Description"].trim() !== selectedDescription
         )
         .map((entry) =>
@@ -1847,6 +1644,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     curriculumCourses,
     sectionYearLevels,
     yearLevelCurriculumIds,
+    sectionCurriculumIds,
   ]);
 
   useEffect(() => {
@@ -2933,50 +2731,50 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   };
 
   const handleLoadCurriculum = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
+    const files = Array.from(event.target.files ?? []);
+    if (!files.length || readOnly) return;
     try {
-      const text = await file.text();
-      const courses = parseCurriculumCsv(text);
-      setCurriculumPreview({ fileName: file.name, name: getFileBaseName(file.name), courses });
-      const firstAvailableTerm = curriculumTerms.find((term) =>
-        courses.some((course) => course.semester === term)
-      );
-      if (firstAvailableTerm) {
-        setCurriculumTerm(firstAvailableTerm);
+      if (files.length + curricula.length > 100) throw new Error("Curriculum limit is 100 files");
+      const previews = [];
+      for (const file of files) {
+        if (file.size > 1024 * 1024) throw new Error(`${file.name}: curriculum CSV limit is 1 MiB`);
+        try {
+          const courses = parseCurriculumCsv(await file.text(), activeProgram);
+          previews.push({ fileName: file.name, name: getFileBaseName(file.name), courses });
+        } catch (error) { throw new Error(`${file.name}: ${(error as Error).message}`); }
       }
+      setCurriculumPreview(previews);
     } catch (error) {
-      setToast({
-        message: error instanceof Error ? error.message : "Could not load curriculum",
-        showRevert: false,
-      });
+      setToast({ message: (error as Error).message, showRevert: false });
     }
     setCurriculumInputKey((prev) => prev + 1);
     setOpenMenu(null);
   };
 
-  const handleConfirmCurriculumLoad = () => {
-    if (!curriculumPreview) return;
-    const name = curriculumPreview.name.trim() || getFileBaseName(curriculumPreview.fileName);
-    const curriculum: Curriculum = {
-      id: buildCurriculumId(),
-      name,
-      sourceFileName: curriculumPreview.fileName,
-      importedAt: new Date().toISOString(),
-      courses: curriculumPreview.courses,
-    };
-    setCurricula((prev) => [...prev, curriculum]);
-    setCurriculumPreview(null);
-    setToast({
-      message: `Loaded ${curriculumPreview.courses.length} curriculum courses into ${name}`,
-      showRevert: false,
-    });
+  const handleConfirmCurriculumLoad = async () => {
+    if (!curriculumPreview || isCurriculumSaving || readOnly) return;
+    setIsCurriculumSaving(true);
+    if (settingsSaveTimeout.current) window.clearTimeout(settingsSaveTimeout.current);
+    try {
+      const additions: Curriculum[] = curriculumPreview.map(preview => ({
+        id: buildCurriculumId(), name: preview.name.trim() || getFileBaseName(preview.fileName),
+        sourceFileName: preview.fileName, importedAt: new Date().toISOString(), courses: preview.courses,
+      }));
+      const next = { ...curriculumState, curricula: [...curricula, ...additions] };
+      await persistSettings(customizeSettings, next);
+      applyCurriculumState(next);
+      setCurriculumPreview(null);
+      setToast({ message: `Saved ${additions.length} curricula. Use Edit Sections to assign each year level or section.`, showRevert: false });
+    } catch (error) {
+      setToast({ message: `Curricula not saved: ${(error as Error).message}`, showRevert: false });
+    } finally { setIsCurriculumSaving(false); }
   };
 
   const handleClearCurriculum = () => {
     setCurricula([]);
     setCurriculumPreview(null);
     setYearLevelCurriculumIds({});
+    setSectionCurriculumIds({});
     localStorage.removeItem(CURRICULUM_STORAGE_KEY);
     localStorage.removeItem(CURRICULUM_STATE_STORAGE_KEY);
     localStorage.removeItem(CURRICULUM_STORAGE_VERSION_KEY);
@@ -2986,6 +2784,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   const handleRemoveCurriculum = (curriculumId: string) => {
     const curriculum = getCurriculumById(curriculumId);
     setCurricula((prev) => prev.filter((item) => item.id !== curriculumId));
+    setSectionCurriculumIds(prev => Object.fromEntries(Object.entries(prev).filter(([, id]) => id !== curriculumId)));
     setYearLevelCurriculumIds((prev) =>
       Object.fromEntries(
         Object.entries(prev).filter(([, assignedId]) => assignedId !== curriculumId)
@@ -3045,6 +2844,11 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     const oldKey = normalizeMatchValue(oldName);
     const nextKey = normalizeMatchValue(nextName);
     if (kind === "section") {
+      setSectionCurriculumIds(prev => {
+        const next = { ...prev };
+        if (next[oldKey]) { next[nextKey] = next[oldKey]; delete next[oldKey]; }
+        return next;
+      });
       setSectionYearLevels((prev) => {
         const next = { ...prev };
         if (next[oldKey]) {
@@ -3097,6 +2901,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   const applyEntityRemovalLocally = (kind: EntityEditorKind, name: string) => {
     const key = normalizeMatchValue(name);
     if (kind === "section") {
+      setSectionCurriculumIds(prev => { const next = { ...prev }; delete next[key]; return next; });
       setSectionYearLevels((prev) => {
         const next = { ...prev };
         delete next[key];
@@ -3553,7 +3358,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                     Download CSV
                   </button>
                   <label className="menu-item file-input">
-                    Import CSV
+                    Import Timetable CSV
                     <input
                       key={csvInputKey}
                       disabled={readOnly}
@@ -3564,9 +3369,10 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                   </label>
                   <div className="menu-divider" />
                   <label className="menu-item file-input">
-                    Load Curriculum
+                    Load Curricula
                     <input
                       key={curriculumInputKey}
+                      multiple
                       disabled={readOnly}
                       type="file"
                       accept=".csv"
@@ -3575,6 +3381,9 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                   </label>
                   {curricula.length > 0 ? (
                     <>
+                      <button className="menu-item" type="button" onClick={() => {
+                        openEntityEditor("section"); setOpenMenu(null);
+                      }}>Manage Curricula</button>
                       <label className="menu-checkbox menu-select">
                         Semester
                         <select
@@ -3592,6 +3401,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                       </label>
                       <button
                         className="menu-item"
+                        disabled={readOnly}
                         onClick={() => {
                           handleClearCurriculum();
                           setOpenMenu(null);
@@ -4009,22 +3819,17 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       {curriculumPreview ? (
         <div className="modal-overlay">
           <div className="modal">
-            <h3>Load Curriculum</h3>
-            <p>
-              {curriculumPreview.fileName} contains{" "}
-              <strong>{curriculumPreview.courses.length}</strong> courses.
-            </p>
-            <label className="modal-field">
-              Name
-              <input
-                value={curriculumPreview.name}
-                onChange={(event) =>
-                  setCurriculumPreview((prev) =>
-                    prev ? { ...prev, name: event.target.value } : prev
-                  )
-                }
-              />
-            </label>
+            <h3>Load Curricula</h3>
+            <p>Add {curriculumPreview.length} curricula to {activeProgram}. Existing curricula are retained.</p>
+            {curriculumPreview.map((preview, index) => (
+              <label className="modal-field" key={preview.fileName + index}>
+                {preview.fileName} — {preview.courses.length} lecture/lab entries
+                <input aria-label={`Curriculum name ${index + 1}`} maxLength={200} value={preview.name}
+                  disabled={isCurriculumSaving}
+                  onChange={event => setCurriculumPreview(prev => prev?.map((item, i) => i === index ? { ...item, name: event.target.value } : item) ?? null)} />
+                {preview.courses.some(course => course.unitNotes) ? <span>Parenthesized unit notes (including RLE) are retained; calculated hours follow the rules below.</span> : null}
+              </label>
+            ))}
             <label className="modal-field">
               Semester
               <select
@@ -4032,7 +3837,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                 onChange={(event) => setCurriculumTerm(event.target.value as CurriculumTerm)}
               >
                 {curriculumTerms.map((term) => {
-                  const count = curriculumPreview.courses.filter(
+                  const count = curriculumPreview.flatMap(preview => preview.courses).filter(
                     (course) => course.semester === term
                   ).length;
                   return (
@@ -4049,11 +3854,11 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
               4.25 hours.
             </div>
             <div className="modal-actions">
-              <button type="button" onClick={() => setCurriculumPreview(null)}>
+              <button type="button" disabled={isCurriculumSaving} onClick={() => setCurriculumPreview(null)}>
                 Cancel
               </button>
-              <button type="button" onClick={handleConfirmCurriculumLoad}>
-                Load
+              <button type="button" disabled={isCurriculumSaving} onClick={handleConfirmCurriculumLoad}>
+                {isCurriculumSaving ? "Saving..." : "Load and Save"}
               </button>
             </div>
           </div>
@@ -4120,6 +3925,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
             {entityEditorConfig.kind === "section" && curricula.length > 0 ? (
               <div className="entity-editor-panel">
                 <h4>Curricula</h4>
+                <p>Choose a default curriculum for each year level. A section can override that default below.</p>
                 <div className="curriculum-editor-list">
                   {curricula.map((curriculum) => (
                     <div key={curriculum.id} className="curriculum-editor-row">
@@ -4129,6 +3935,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                       <button
                         type="button"
                         className="danger-button"
+                        disabled={readOnly}
                         onClick={() => handleRemoveCurriculum(curriculum.id)}
                       >
                         Remove
@@ -4142,12 +3949,13 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                       <label key={yearLevel} className="year-curriculum-row">
                         {yearLevel}
                         <select
+                          disabled={readOnly}
                           value={getYearLevelCurriculumId(yearLevel)}
                           onChange={(event) =>
                             updateYearLevelCurriculum(yearLevel, event.target.value)
                           }
                         >
-                          <option value="">All curricula</option>
+                          <option value="">All curricula (unassigned)</option>
                           {curricula.map((curriculum) => (
                             <option key={curriculum.id} value={curriculum.id}>
                               {curriculum.name}
@@ -4192,7 +4000,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                   <div
                     key={entity.id}
                     className={`entity-editor-row ${
-                      entityEditorConfig.kind === "section" ? "" : "simple"
+                      entityEditorConfig.kind === "section" ? (curricula.length ? "with-curriculum" : "") : "simple"
                     }`}
                   >
                     <input
@@ -4210,7 +4018,8 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                         onChange={(event) =>
                           updateSectionYearLevel(entity.name, event.target.value)
                         }
-                        disabled={curriculumYearLevels.length === 0}
+                        aria-label={`Year level for ${entity.name}`}
+                        disabled={readOnly || curriculumYearLevels.length === 0}
                       >
                         <option value="">All year levels</option>
                         {curriculumYearLevels.map((yearLevel) => (
@@ -4218,6 +4027,18 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                             {yearLevel}
                           </option>
                         ))}
+                      </select>
+                    ) : null}
+                    {entityEditorConfig.kind === "section" && curricula.length > 0 ? (
+                      <select aria-label={`Curriculum for ${entity.name}`} disabled={readOnly}
+                        value={sectionCurriculumIds[normalizeMatchValue(entity.name)] ?? ""}
+                        onChange={event => setSectionCurriculumIds(prev => {
+                          const next = { ...prev }; const key = normalizeMatchValue(entity.name);
+                          if (event.target.value) next[key] = event.target.value; else delete next[key];
+                          return next;
+                        })}>
+                        <option value="">Use year-level curriculum</option>
+                        {curricula.map(curriculum => <option key={curriculum.id} value={curriculum.id}>{curriculum.name}</option>)}
                       </select>
                     ) : null}
                     <button type="button" disabled={readOnly || (entityEditorConfig.kind !== "section" && !isAdmin)} onClick={() => handleRenameEntity(entity)}>

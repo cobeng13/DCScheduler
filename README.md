@@ -39,6 +39,8 @@ Set `COOKIE_SECURE=false` for local HTTP development only. Production uses secur
 
 ## Notes
 
+- Use **File > Load Curricula** for curriculum catalogs and **Import Timetable CSV** for scheduled classes. Multiple curricula and per-section curriculum overrides are supported. See [CURRICULUM_IMPORTS.md](CURRICULUM_IMPORTS.md) for accepted headers, BSMLS file compatibility, and assignment instructions.
+
 - Production data is stored in a dedicated persistent PostgreSQL volume. A NEW SQLite database at `backend/scheduler.db` can be used for local development.
 - The **File** menu provides program-scoped clearing/import and CSV downloads. Server backups replace database-file Open/Save.
 - CSV exports and timetable PNG export are available in the **Export** group.

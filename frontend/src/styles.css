@@ -1230,3 +1230,7 @@ body {
   padding: 6px 0;
   border-bottom: 1px solid #e1e6ef;
 }
+
+.entity-editor-row.with-curriculum {
+  grid-template-columns: minmax(120px, 1fr) minmax(110px, .7fr) minmax(140px, 1fr) auto auto;
+}

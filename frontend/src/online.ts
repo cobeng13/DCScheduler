@@ -42,9 +42,10 @@ export const scopedStorage = {
 export function errorMessage(detail: unknown): string {
   if (typeof detail === "string") return detail;
   if (detail && typeof detail === "object") {
-    const data = detail as { message?: string; errors?: { row_index: number; reason: string }[] };
+    const data = detail as { message?: string; missing_columns?: string[]; errors?: { row_index: number; reason: string }[] };
     if (data.message) return data.message;
-    if (data.errors) return data.errors.map(e => `Row ${e.row_index}: ${e.reason}`).join("; ");
+    if (data.missing_columns?.length) return `Missing timetable columns: ${data.missing_columns.join(", ")}. For curriculum files, use File > Load Curricula.`;
+    if (data.errors?.length) return data.errors.map(e => `Row ${e.row_index}: ${e.reason}`).join("; ");
   }
   return "The request could not be completed. Review your changes and try again.";
 }

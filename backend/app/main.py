@@ -531,11 +531,27 @@ def put_settings(payload: dict, program_id: int | None = None, db: Session = Db,
                 if not isinstance(course, dict):
                     raise HTTPException(422, "Invalid curriculum course")
                 for key, maximum in {"program": 200, "courseCode": 100, "courseDescription": 2000,
-                                     "yearLevel": 100, "semester": 100}.items():
+                                     "yearLevel": 100, "semester": 100, "unitNotes": 200,
+                                     "prerequisite": 2000}.items():
                     if key in course and (not isinstance(course[key], str) or len(course[key]) > maximum):
                         raise HTTPException(422, f"Invalid curriculum course {key}; maximum {maximum} characters")
                 if course.get("program") != program.name:
                     raise HTTPException(403, "Curriculum contains a different program")
+        ids = []
+        for curriculum in curricula:
+            identity = curriculum.get("id")
+            if not isinstance(identity, str) or not identity or len(identity) > 200 or identity in ids:
+                raise HTTPException(422, "Curricula require unique identifiers of 1–200 characters")
+            ids.append(identity)
+            for field, maximum in {"name": 200, "sourceFileName": 255}.items():
+                if field in curriculum and (not isinstance(curriculum[field], str) or len(curriculum[field]) > maximum):
+                    raise HTTPException(422, f"Invalid curriculum {field}")
+        for field in ("yearLevelCurriculumIds", "sectionCurriculumIds", "sectionYearLevels"):
+            mapping = state.get(field, {})
+            if not isinstance(mapping, dict) or any(not isinstance(value, str) or len(value) > 200 for value in mapping.values()):
+                raise HTTPException(422, "Invalid curriculum assignments")
+            if field != "sectionYearLevels" and any(value and value not in ids for value in mapping.values()):
+                raise HTTPException(422, "Curriculum assignment references a missing curriculum")
         old = json.loads(program.settings_json)
         program.settings_json = json.dumps({"curriculumState": state})
         program.version += 1

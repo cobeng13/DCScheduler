@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
-import { configure, schedulerFetch, pinVersion, withExpectedVersions, scopedStorage } from "../src/online.ts";
+import { configure, schedulerFetch, pinVersion, withExpectedVersions, scopedStorage, errorMessage } from "../src/online.ts";
 
 const alpha = { id: 2, username: "alpha", is_admin: false, disabled: false, must_change_password: false };
 const program = { id: 1, name: "P1", assigned_user_id: 2, version: 1 };
@@ -21,6 +21,11 @@ globalThis.window = {
   },
 };
 beforeEach(() => { calls = []; responses = []; configure(null, "", null); withExpectedVersions(null); configure(alpha, "csrf-test", program); });
+
+test("curriculum CSV sent to timetable import receives a useful format error", () => {
+  assert.match(errorMessage({ missing_columns: ["Program", "Section", "Days"], errors: [] }), /Load Curricula/);
+  assert.notEqual(errorMessage({ errors: [] }), "");
+});
 
 test("same-origin transport adds scope and CSRF", async () => {
   responses.push([]);
