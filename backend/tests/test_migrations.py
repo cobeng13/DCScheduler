@@ -1,11 +1,38 @@
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, inspect, text
 from app.models import Base
+
+
+def test_alembic_cli_imports_app_without_backend_pythonpath(tmp_path):
+    """Console scripts do not put the working directory on Python's import path."""
+    backend = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    # Keep external test dependency locations, but remove the path that previously
+    # masked the missing Alembic prepend_sys_path setting in our test harness.
+    env["PYTHONPATH"] = os.pathsep.join(part for part in env.get("PYTHONPATH", "").split(os.pathsep)
+        if part and Path(part).resolve() not in {backend, backend.parent})
+    database = tmp_path / "cli.db"
+    env["DATABASE_URL"] = "sqlite:///" + str(database)
+    env.pop("DATABASE_PASSWORD_FILE", None)
+    result = subprocess.run([sys.executable, "-c", "from alembic.config import main; main()",
+        "-c", str(backend / "alembic.ini"), "upgrade", "head"], cwd=tmp_path, env=env,
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    engine = create_engine(env["DATABASE_URL"])
+    try:
+        with engine.connect() as connection:
+            assert "users" in inspect(connection).get_table_names()
+            assert compare_metadata(MigrationContext.configure(connection), Base.metadata) == []
+    finally:
+        engine.dispose()
 
 
 def apply_revisions(connection, stop=None):
