@@ -1,8 +1,11 @@
 import html2canvas from "html2canvas";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { schedulerFetch as fetch, pinVersion, programName, snapshotVersions, withExpectedVersions, scopedStorage as localStorage } from "./online";
 
 type ScheduleEntry = {
   id: number;
+  version?: number;
+  program_id?: number;
   "Program": string;
   "Section": string;
   "Course Code": string;
@@ -16,7 +19,7 @@ type ScheduleEntry = {
   Faculty: string;
 };
 
-type NamedEntity = { id: number; name: string };
+type NamedEntity = { id: number; name: string; version?: number; program_id?: number };
 
 type ConflictSummary = {
   entry_id: number;
@@ -96,11 +99,11 @@ type MoveSnapshot = {
   deletedEntry?: ScheduleEntry;
 };
 
-type UndoAction =
+type UndoAction = (
   | { type: "add"; entryId: number; label: string }
   | { type: "delete"; entry: ScheduleEntry; label: string }
   | { type: "edit"; entry: ScheduleEntry; label: string }
-  | { type: "move"; snapshot: MoveSnapshot; label: string };
+  | { type: "move"; snapshot: MoveSnapshot; label: string }) & { expectedVersions?: Record<string, number> };
 
 type CustomizeSettings = {
   blockDisplay: {
@@ -124,8 +127,7 @@ type ConflictIgnoreSettings = {
   containsRoom: boolean;
 };
 
-const API_BASE = "http://localhost:8000";
-const API_FALLBACK_BASE = "http://localhost:8001";
+const API_BASE = `${window.location.origin}/api`;
 const CUSTOMIZE_STORAGE_KEY = "scheduler.customize";
 const CURRICULUM_STORAGE_KEY = "scheduler.curriculum";
 const CURRICULUM_STATE_STORAGE_KEY = "scheduler.curriculum.state";
@@ -234,7 +236,7 @@ const getFileBaseName = (fileName: string) =>
 
 const buildEmptyScheduleForm = (defaults?: Partial<ScheduleEntry>): ScheduleEntry => ({
   id: 0,
-  "Program": defaults?.Program ?? "",
+  "Program": defaults?.Program ?? programName(),
   "Section": defaults?.Section ?? "",
   "Course Code": "",
   "Course Description": "",
@@ -715,7 +717,7 @@ const normalizeDays = (value: string) => {
   return canonical.join(",");
 };
 
-export default function App() {
+export default function App({ readOnly = false, activeProgram = "", isAdmin = false }: { readOnly?: boolean; activeProgram?: string; isAdmin?: boolean }) {
   const [entries, setEntries] = useState<ScheduleEntry[]>([]);
   const [sections, setSections] = useState<NamedEntity[]>([]);
   const [faculty, setFaculty] = useState<NamedEntity[]>([]);
@@ -811,7 +813,6 @@ export default function App() {
   } | null>(null);
   const [isCsvImporting, setIsCsvImporting] = useState(false);
   const [csvInputKey, setCsvInputKey] = useState(0);
-  const [dbInputKey, setDbInputKey] = useState(0);
   const [curricula, setCurricula] = useState<Curriculum[]>([]);
   const [curriculumTerm, setCurriculumTerm] = useState<CurriculumTerm>("First Semester");
   const [curriculumPreview, setCurriculumPreview] = useState<{
@@ -910,7 +911,7 @@ export default function App() {
     const storedZoom = localStorage.getItem("timetableZoom");
     setScheduleForm((prev) => ({
       ...prev,
-      Program: storedProgram ?? prev.Program,
+      Program: activeProgram || storedProgram || prev.Program,
       Section: storedSection ?? prev.Section,
     }));
     if (storedZoom) {
@@ -1069,7 +1070,7 @@ export default function App() {
   };
 
   const pushUndoAction = (action: UndoAction) => {
-    setUndoStack((prev) => [action, ...prev].slice(0, 20));
+    setUndoStack((prev) => [{ ...action, expectedVersions: snapshotVersions() }, ...prev].slice(0, 20));
   };
 
   const refreshAll = async (conflictSettings: ConflictIgnoreSettings = conflictIgnoreSettings) => {
@@ -1121,6 +1122,20 @@ export default function App() {
     };
     initialize();
   }, []);
+
+  useEffect(() => {
+    const liveRefresh = () => { refreshAll().catch(() => {}); };
+    const failedSave = (event: Event) => {
+      const message = (event as CustomEvent<string>).detail;
+      setIsSaving(false);
+      setToast({ message, showRevert: false });
+      setFormError(message);
+      setEditError(message);
+    };
+    window.addEventListener("scheduler-refresh", liveRefresh);
+    window.addEventListener("scheduler-error", failedSave);
+    return () => { window.removeEventListener("scheduler-refresh", liveRefresh); window.removeEventListener("scheduler-error", failedSave); };
+  });
 
   useEffect(() => {
     if (!settingsLoaded) return;
@@ -1963,6 +1978,7 @@ export default function App() {
   };
 
   const handleDragStart = (entry: ScheduleEntry, day: string) => {
+    if (readOnly) return;
     const parsed = parseTimeRange(entry["Time (24 Hrs)"]);
     if (!parsed) return;
     const { start, end } = parsed;
@@ -2037,6 +2053,7 @@ export default function App() {
   };
 
   const handleDrop = async () => {
+    if (readOnly) return;
     if (!dragging || !dragTarget) return;
     const { entry, day: originDay, duration } = dragging;
     const startMinutes = dragTarget.startMinutes;
@@ -2063,33 +2080,23 @@ export default function App() {
 
     if (isSaving) return;
     setIsSaving(true);
+    const operations: Record<string, unknown>[] = [];
     if (days.length > 1) {
       const remaining = days.filter((token) => token !== originDay);
       if (remaining.length > 0) {
-        await fetch(`${API_BASE}/schedule/${entry.id}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...entry, Days: remaining.join(",") }),
-        });
+        operations.push({ method: "PUT", id: entry.id, entry: { ...entry, Days: remaining.join(",") } });
       } else {
-        await fetch(`${API_BASE}/schedule/${entry.id}`, { method: "DELETE" });
+        operations.push({ method: "DELETE", id: entry.id, version: entry.version });
         snapshot.deletedEntry = entry;
       }
       const { id: _id, ...createPayload } = payloadBase;
-      const createResponse = await fetch(`${API_BASE}/schedule`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(createPayload),
-      });
-      const created = await createResponse.json();
-      snapshot.createdEntryId = created.id;
+      operations.push({ method: "POST", entry: createPayload });
     } else {
-      await fetch(`${API_BASE}/schedule/${entry.id}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payloadBase),
-      });
+      operations.push({ method: "PUT", id: entry.id, entry: payloadBase });
     }
+    const response = await fetch(`${API_BASE}/schedule/batch`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operations }) });
+    const changed = await response.json() as ScheduleEntry[];
+    if (days.length > 1) snapshot.createdEntryId = changed[changed.length - 1].id;
 
     setMoveSnapshot(snapshot);
     pushUndoAction({ type: "move", snapshot, label: "Move Class" });
@@ -2104,31 +2111,28 @@ export default function App() {
   };
 
   const revertMoveSnapshot = async (snapshot: MoveSnapshot) => {
+    const operations: Record<string, unknown>[] = [];
     if (snapshot.createdEntryId) {
-      await fetch(`${API_BASE}/schedule/${snapshot.createdEntryId}`, { method: "DELETE" });
+      operations.push({ method: "DELETE", id: snapshot.createdEntryId });
     }
     if (snapshot.deletedEntry) {
       const { id, ...rest } = snapshot.deletedEntry;
-      await fetch(`${API_BASE}/schedule`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(rest),
-      });
+      operations.push({ method: "POST", entry: rest });
     }
     for (const entry of snapshot.previousEntries) {
-      await fetch(`${API_BASE}/schedule/${entry.id}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(entry),
-      });
+      if (entry.id !== snapshot.deletedEntry?.id) operations.push({ method: "PUT", id: entry.id, entry });
     }
+    await fetch(`${API_BASE}/schedule/batch`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operations }) });
   };
 
   const handleRevertMove = async () => {
     if (!moveSnapshot) return;
     if (isSaving) return;
     setIsSaving(true);
-    await revertMoveSnapshot(moveSnapshot);
+    const action = undoStack.find(action => action.type === "move" && action.snapshot === moveSnapshot);
+    withExpectedVersions(action?.expectedVersions ?? null);
+    try { await revertMoveSnapshot(moveSnapshot); }
+    finally { withExpectedVersions(null); setIsSaving(false); }
     setMoveSnapshot(null);
     setToast({ message: "Move reverted", showRevert: false });
     await refreshAll();
@@ -2138,8 +2142,9 @@ export default function App() {
   const handleUndo = async () => {
     if (undoStack.length === 0 || isSaving) return;
     const [action, ...rest] = undoStack;
-    setUndoStack(rest);
     setIsSaving(true);
+    withExpectedVersions(action.expectedVersions ?? null);
+    try {
     if (action.type === "add") {
       await fetch(`${API_BASE}/schedule/${action.entryId}`, { method: "DELETE" });
     } else if (action.type === "delete") {
@@ -2158,9 +2163,14 @@ export default function App() {
     } else if (action.type === "move") {
       await revertMoveSnapshot(action.snapshot);
     }
+    setUndoStack(rest);
     setToast({ message: `Undid: ${action.label}`, showRevert: false });
     await refreshAll();
     setIsSaving(false);
+    } finally {
+      withExpectedVersions(null);
+      setIsSaving(false);
+    }
   };
 
   const selectionRange = useMemo(() => {
@@ -2373,6 +2383,8 @@ export default function App() {
   };
 
   const enterEditMode = (entry: ScheduleEntry) => {
+    if (readOnly) return;
+    pinVersion("schedule", entry.id, entry.version);
     setFormEditId(entry.id);
     setScheduleForm(entry);
     setFormError("");
@@ -2453,6 +2465,8 @@ export default function App() {
   };
 
   const deleteEntry = async (entry: ScheduleEntry) => {
+    if (readOnly) return;
+    pinVersion("schedule", entry.id, entry.version);
     if (isSaving) return;
     const confirmed = window.confirm("Delete this class?");
     if (!confirmed) return;
@@ -2586,6 +2600,7 @@ export default function App() {
 
   const ensureEntityExists = async (path: string, name: string, entities: NamedEntity[]) => {
     if (!name.trim()) return;
+    if (path !== "sections" && name.trim().toLowerCase() === "tba") return;
     const exists = entities.some(
       (entity) => entity.name.toLowerCase() === name.trim().toLowerCase()
     );
@@ -2696,6 +2711,8 @@ export default function App() {
   };
 
   const handleEdit = (entry: ScheduleEntry) => {
+    if (readOnly) return;
+    pinVersion("schedule", entry.id, entry.version);
     setEditEntryId(entry.id);
     setEditEntry({ ...entry });
     setEditError("");
@@ -2788,6 +2805,8 @@ export default function App() {
 
   const handleDeleteEntry = async (entryId: number) => {
     const entry = entries.find((item) => item.id === entryId);
+    if (readOnly) return;
+    pinVersion("schedule", entryId, entry?.version);
     await fetch(`${API_BASE}/schedule/${entryId}`, { method: "DELETE" });
     if (entry) {
       await updateCourseSectionHoursAfterRemoval(entry);
@@ -2845,35 +2864,9 @@ export default function App() {
   };
 
   const handleExportDb = async () => {
-    await persistSettings(customizeSettings, curriculumState);
-    const res = await fetch(`${API_BASE}/file/export`);
+    const res = await fetch(`${API_BASE}/reports/text.csv`);
     const blob = await res.blob();
-    downloadBlob(blob, "scheduler.db");
-  };
-
-  const handleImportDb = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    try {
-      const form = new FormData();
-      form.append("file", file);
-      const response = await fetch(`${API_BASE}/file/import`, { method: "POST", body: form });
-      if (!response.ok) {
-        const body = await response.json().catch(() => null);
-        throw new Error(body?.detail ?? `Could not open timetable (${response.status})`);
-      }
-      setUndoStack([]);
-      const loadedConflictIgnoreSettings = await loadSettingsFromServer();
-      await refreshAll(loadedConflictIgnoreSettings);
-      setToast({ message: `Opened ${file.name}`, showRevert: false });
-    } catch (error) {
-      setToast({
-        message: error instanceof Error ? error.message : "Could not open timetable",
-        showRevert: false,
-      });
-    } finally {
-      setDbInputKey((prev) => prev + 1);
-    }
+    downloadBlob(blob, "schedule.csv");
   };
 
   const handleImportCsvPreview = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -3132,6 +3125,7 @@ export default function App() {
   };
 
   const handleRenameEntity = async (entity: NamedEntity) => {
+    pinVersion(entityEditorConfig.path, entity.id, entity.version);
     const nextName = (entityNameDrafts[entity.id] ?? entity.name).trim();
     if (!nextName) {
       setEntityEditorError(`${entityEditorConfig.label} name cannot be blank.`);
@@ -3205,74 +3199,13 @@ export default function App() {
     await refreshAll();
   };
 
-  const deleteScheduleEntriesForEntity = async (entity: NamedEntity) => {
-    const params = new URLSearchParams();
-    if (entityEditorConfig.kind === "section") {
-      params.set("section", entity.name);
-    } else if (entityEditorConfig.kind === "faculty") {
-      params.set("faculty", entity.name);
-    } else {
-      params.set("room", entity.name);
-    }
-    const entriesResponse = await fetch(`${API_BASE}/schedule?${params.toString()}`);
-    if (!entriesResponse.ok) {
-      throw new Error("Could not load related classes.");
-    }
-    const relatedEntries = (await entriesResponse.json()) as ScheduleEntry[];
-    for (const entry of relatedEntries) {
-      const deleteResponse = await fetch(`${API_BASE}/schedule/${entry.id}`, {
-        method: "DELETE",
-      });
-      if (!deleteResponse.ok && deleteResponse.status !== 404) {
-        throw new Error("Could not remove every related class.");
-      }
-    }
-  };
-
   const handleDeleteEntity = async (entity: NamedEntity) => {
+    pinVersion(entityEditorConfig.path, entity.id, entity.version);
     setEntityEditorError("");
-    if (forceEntityRemove) {
-      try {
-        await deleteScheduleEntriesForEntity(entity);
-      } catch (error) {
-        setEntityEditorError(
-          error instanceof Error ? error.message : "Could not remove related classes."
-        );
-        return;
-      }
-    }
-    const removeEntity = async (base: string) => {
-      const removeUrl = new URL(`${base}/${entityEditorConfig.path}/${entity.id}/remove`);
-      if (forceEntityRemove) {
-        removeUrl.searchParams.set("force", "true");
-      }
-      const removeResponse = await fetch(removeUrl.toString(), { method: "POST" });
-      if (removeResponse.status !== 405) {
-        return removeResponse;
-      }
-      const deleteUrl = new URL(`${base}/${entityEditorConfig.path}/${entity.id}`);
-      if (forceEntityRemove) {
-        deleteUrl.searchParams.set("force", "true");
-      }
-      return fetch(deleteUrl.toString(), { method: "DELETE" });
-    };
-    let response = await removeEntity(API_BASE);
-    if (response.status === 405) {
-      try {
-        response = await removeEntity(API_FALLBACK_BASE);
-      } catch {
-        setEntityEditorError(
-          "The backend currently running does not support faculty/room removal. Restart the backend, then try again."
-        );
-        return;
-      }
-      if (response.status === 405) {
-        setEntityEditorError(
-          "The backend currently running does not support faculty/room removal. Restart the backend, then try again."
-        );
-        return;
-      }
-    }
+    if (forceEntityRemove && !window.confirm(`Remove ${entity.name} and all its scheduled classes in this program?`)) return;
+    const removeUrl = new URL(`${API_BASE}/${entityEditorConfig.path}/${entity.id}`);
+    if (forceEntityRemove) removeUrl.searchParams.set("force", "true");
+    const response = await fetch(removeUrl.toString(), { method: "DELETE" });
     if (!response.ok) {
       const body = await response.json().catch(() => null);
       setEntityEditorError(body?.detail ?? `Could not delete ${entityEditorConfig.label.toLowerCase()}.`);
@@ -3578,7 +3511,8 @@ export default function App() {
 
 
   return (
-    <div className="app">
+    <div className={`app ${readOnly ? "online-readonly" : ""}`}>
+      {readOnly && <div className="readonly-banner">View only. Select a program assigned to you to edit its schedule. Shared room and faculty conflicts include every program.</div>}
       {toast && !toast.showRevert && (
         <div className="toast global" role="status" aria-live="polite">
           <span>{toast.message}</span>
@@ -3599,13 +3533,14 @@ export default function App() {
                 <div className="menu-dropdown" role="menu">
                   <button
                     className="menu-item"
+                    disabled={readOnly}
                     onClick={() => {
                       handleReset();
                       setOpenMenu(null);
                     }}
                     type="button"
                   >
-                    New Timetable
+                    Clear Program
                   </button>
                   <button
                     className="menu-item"
@@ -3615,24 +3550,13 @@ export default function App() {
                     }}
                     type="button"
                   >
-                    Save
+                    Download CSV
                   </button>
-                  <label className="menu-item file-input">
-                    Open Timetable
-                    <input
-                      key={dbInputKey}
-                      type="file"
-                      accept=".db,.sqlite,.sqlite3,application/x-sqlite3"
-                      onChange={(event) => {
-                        handleImportDb(event);
-                        setOpenMenu(null);
-                      }}
-                    />
-                  </label>
                   <label className="menu-item file-input">
                     Import CSV
                     <input
                       key={csvInputKey}
+                      disabled={readOnly}
                       type="file"
                       accept=".csv"
                       onChange={handleImportCsvPreview}
@@ -3643,6 +3567,7 @@ export default function App() {
                     Load Curriculum
                     <input
                       key={curriculumInputKey}
+                      disabled={readOnly}
                       type="file"
                       accept=".csv"
                       onChange={handleLoadCurriculum}
@@ -3685,7 +3610,7 @@ export default function App() {
                 className="menu-button"
                 type="button"
                 onClick={handleUndo}
-                disabled={undoStack.length === 0 || isSaving}
+                disabled={readOnly || undoStack.length === 0 || isSaving}
               >
                 Undo
               </button>
@@ -3693,6 +3618,7 @@ export default function App() {
             <div className="menu-group">
               <button
                 className={`menu-button ${openMenu === "edit" ? "active" : ""}`}
+                disabled={readOnly}
                 onClick={() => setOpenMenu((prev) => (prev === "edit" ? null : "edit"))}
                 type="button"
               >
@@ -3826,10 +3752,11 @@ export default function App() {
             <div className="menu-group">
               <button
                 className={`menu-button ${openMenu === "rules" ? "active" : ""}`}
-                onClick={() => setOpenMenu((prev) => (prev === "rules" ? null : "rules"))}
+                title="Online saves always check section, room and faculty bookings across every program. Admin overrides require a reason."
+                disabled
                 type="button"
               >
-                Rules ▼
+                Rules enforced
               </button>
               {openMenu === "rules" ? (
                 <div className="menu-dropdown rules-dropdown" role="menu">
@@ -4237,6 +4164,7 @@ export default function App() {
               <input
                 type="checkbox"
                 checked={forceEntityRemove}
+                disabled={entityEditorConfig.kind !== "section"}
                 onChange={(event) => setForceEntityRemove(event.target.checked)}
               />
               Forcefully remove {entityEditorConfig.label.toLowerCase()} and related classes
@@ -4292,13 +4220,14 @@ export default function App() {
                         ))}
                       </select>
                     ) : null}
-                    <button type="button" onClick={() => handleRenameEntity(entity)}>
+                    <button type="button" disabled={readOnly || (entityEditorConfig.kind !== "section" && !isAdmin)} onClick={() => handleRenameEntity(entity)}>
                       Rename
                     </button>
                     <button
                       type="button"
                       className="danger-button"
                       onClick={() => handleDeleteEntity(entity)}
+                      disabled={readOnly || (entityEditorConfig.kind !== "section" && !isAdmin)}
                     >
                       Remove
                     </button>
@@ -4657,24 +4586,23 @@ export default function App() {
           {showStartPage ? (
             <div className="start-page">
               <div className="start-page-copy">
-                <h2>Start a timetable</h2>
+                <h2>{readOnly ? "No classes in this program yet" : "Start a timetable"}</h2>
                 <p>
-                  Open an existing timetable, import a CSV, or create the first section
-                  and add classes from the panel on the right.
+                  {readOnly ? "Choose another program to view its timetable." : "Import a program CSV, or create the first section and add classes from the panel on the right."}
                 </p>
               </div>
               <div className="start-actions">
                 <button type="button" onClick={() => setOpenMenu("file")}>
                   Open File Menu
                 </button>
-                <button type="button" onClick={() => openEntityEditor("section")}>
+                <button type="button" disabled={readOnly} onClick={() => openEntityEditor("section")}>
                   Create or Edit Sections
                 </button>
               </div>
               <div className="start-steps">
                 <div>
                   <strong>1. Bring in data</strong>
-                  <span>Use File to open a saved timetable or import a schedule CSV.</span>
+                  <span>Use File to import a CSV for your selected program.</span>
                 </div>
                 <div>
                   <strong>2. Set up lists</strong>
@@ -4820,8 +4748,8 @@ export default function App() {
                   </>
                         ) : (
                           <>
-                            <button onClick={() => handleEdit(entry)}>Edit</button>
-                            <button onClick={() => handleDeleteEntry(entry.id)}>Delete</button>
+                            <button disabled={readOnly} onClick={() => handleEdit(entry)}>Edit</button>
+                            <button disabled={readOnly} onClick={() => handleDeleteEntry(entry.id)}>Delete</button>
                           </>
                         )}
                       </td>
@@ -5072,7 +5000,7 @@ export default function App() {
                   className="block-menu"
                   style={{ top: blockMenu.y, left: blockMenu.x }}
                 >
-                  <button onClick={() => enterEditMode(blockMenu.entry)} disabled={isSaving}>
+                  <button onClick={() => enterEditMode(blockMenu.entry)} disabled={readOnly || isSaving}>
                     Edit
                   </button>
                   <button onClick={copyBlock} disabled={isSaving}>
@@ -5084,7 +5012,7 @@ export default function App() {
                   >
                     Duplicate to Next Day
                   </button>
-                  <button onClick={() => deleteEntry(blockMenu.entry)} disabled={isSaving}>
+                  <button onClick={() => deleteEntry(blockMenu.entry)} disabled={readOnly || isSaving}>
                     Delete
                   </button>
                 </div>
@@ -5096,6 +5024,7 @@ export default function App() {
         </div>
 
         <aside className={`panel ${formEditId ? "editing" : ""}`} ref={panelRef}>
+          <fieldset disabled={readOnly} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
           {formEditId && (
             <div className="edit-mode-banner">
               <div>
@@ -5129,6 +5058,7 @@ export default function App() {
             Program
             <input
               value={scheduleForm.Program}
+              readOnly
               onChange={(event) => {
                 const value = event.target.value;
                 setScheduleForm({ ...scheduleForm, Program: value });
@@ -5380,6 +5310,7 @@ export default function App() {
           >
             Add Room
           </button>
+          </fieldset>
         </aside>
       </div>
     </div>

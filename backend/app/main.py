@@ -1,670 +1,712 @@
 from __future__ import annotations
 
-import base64
+import asyncio
 import csv
+from datetime import timedelta
 import io
 import json
-import mimetypes
 import os
-import shutil
-import sqlite3
-import sys
 from pathlib import Path
-from uuid import uuid4
-from typing import List
-from types import SimpleNamespace
+import secrets
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select
+from pydantic import BaseModel, Field, ValidationError
+from sqlalchemy import delete, func, or_, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import conflicts, crud, models, reports, schemas, time_utils
-from .db import DATABASE_PATH, SessionLocal, engine
+from . import auth, models, online_service as service, reports, schemas
+from .db import SessionLocal
 
-mimetypes.add_type("text/javascript", ".js")
-mimetypes.add_type("application/javascript", ".mjs")
-mimetypes.add_type("text/css", ".css")
-mimetypes.add_type("application/wasm", ".wasm")
-mimetypes.add_type("application/json", ".json")
-mimetypes.add_type("application/octet-stream", ".map")
-
-app = FastAPI(title="Scheduler API")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="CAMP Online Scheduler")
+api = APIRouter(prefix="/api")
+Db = Depends(auth.get_db)
+User = Depends(auth.current_user)
+Admin = Depends(auth.admin)
 
 
-models.Base.metadata.create_all(bind=engine)
+@app.middleware("http")
+async def security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["X-Frame-Options"] = "DENY"
+    if request.url.path.startswith("/api"):
+        response.headers["Cache-Control"] = "no-store, no-transform" if request.url.path == "/api/events" else "no-store"
+    return response
 
 
-def get_web_dist() -> Path:
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        return Path(sys._MEIPASS) / "app" / "web" / "dist"
-    return Path(__file__).resolve().parent / "web" / "dist"
+@app.exception_handler(IntegrityError)
+async def duplicate_error(request, exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=409, content={"detail": "A record with that name already exists, or this record is still in use."})
 
 
-web_dist = get_web_dist()
-assets_dir = web_dist / "assets"
-if assets_dir.exists():
-    app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+@app.exception_handler(ValidationError)
+async def invalid_payload(request, exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=422, content={"detail": "Invalid batch entry. Check required fields, units, hours and version."})
 
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+class Credentials(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=256)
 
 
-@app.get("/schedule", response_model=List[schemas.ScheduleEntry])
-def list_schedule(
-    section: str | None = None,
-    faculty: str | None = None,
-    room: str | None = None,
-    db: Session = Depends(get_db),
-):
-    entries = crud.list_schedule_entries(db)
-    if section:
-        entries = [entry for entry in entries if entry.section == section]
-    if faculty:
-        entries = [entry for entry in entries if entry.faculty == faculty]
-    if room:
-        entries = [entry for entry in entries if entry.room == room]
-    return entries
+class PasswordChange(BaseModel):
+    current_password: str = Field(max_length=256)
+    password: str = Field(min_length=12, max_length=256)
 
 
-@app.get("/schedule/{entry_id}", response_model=schemas.ScheduleEntry)
-def get_schedule(entry_id: int, db: Session = Depends(get_db)):
-    entry = crud.get_schedule_entry(db, entry_id)
-    if not entry:
-        raise HTTPException(status_code=404, detail="Not found")
-    return entry
+class UserCreate(Credentials):
+    is_admin: bool = False
 
 
-@app.post("/schedule", response_model=schemas.ScheduleEntry)
-def create_schedule(entry: schemas.ScheduleEntryCreate, db: Session = Depends(get_db)):
-    try:
-        return crud.create_schedule_entry(db, entry)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+class UserUpdate(BaseModel):
+    disabled: bool | None = None
+    password: str | None = Field(default=None, min_length=12, max_length=256)
 
 
-@app.put("/schedule/{entry_id}", response_model=schemas.ScheduleEntry)
-def update_schedule(
-    entry_id: int, entry: schemas.ScheduleEntryUpdate, db: Session = Depends(get_db)
-):
-    try:
-        return crud.update_schedule_entry(db, entry_id, entry)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+class ProgramCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    assigned_user_id: int | None = None
 
 
-@app.delete("/schedule/{entry_id}")
-def delete_schedule(entry_id: int, db: Session = Depends(get_db)):
-    try:
-        crud.delete_schedule_entry(db, entry_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+class ProgramUpdate(BaseModel):
+    assigned_user_id: int | None = None
+    version: int
+
+
+class EntityPayload(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    program_id: int | None = None
+    version: int | None = None
+
+
+class BatchPayload(BaseModel):
+    operations: list[dict] = Field(min_length=1, max_length=200)
+
+
+@api.post("/schedule/batch")
+def schedule_batch(payload: BatchPayload, override_reason: str | None = None, db: Session = Db, user=User):
+    results = []
+    for operation in payload.operations:
+        kind = operation.get("method")
+        if kind == "POST":
+            item = service.save(db, user, schemas.ScheduleEntryCreate.model_validate(operation.get("entry", {})), override_reason=override_reason)
+            results.append(service.serialize(item))
+        elif kind == "PUT":
+            item = service.save(db, user, schemas.ScheduleEntryUpdate.model_validate(operation.get("entry", {})), operation.get("id"), override_reason)
+            results.append(service.serialize(item))
+        elif kind == "DELETE":
+            item = db.get(models.ScheduleEntry, operation.get("id"))
+            if not item:
+                raise HTTPException(404, "Schedule entry not found")
+            service.remove(db, user, item, operation.get("version"))
+            db.flush()
+        else:
+            raise HTTPException(422, "Invalid batch operation")
+    db.commit()
+    return results
+
+
+def program_json(program):
+    return {"id": program.id, "name": program.name, "assigned_user_id": program.assigned_user_id, "version": program.version}
+
+
+def require_program(db, program_id):
+    if program_id is None:
+        raise HTTPException(422, "Select a program")
+    item = db.get(models.Program, program_id)
+    if item is None:
+        raise HTTPException(404, "Program not found")
+    return item
+
+
+@api.get("/health")
+def health(db: Session = Db):
+    db.execute(text("SELECT 1"))
+    # Readiness checks the migrated schema as well as the database connection.
+    db.scalar(select(models.User.id).limit(1))
     return {"ok": True}
 
 
-@app.post("/schedule/{entry_id}/move-check")
-def move_check(
-    entry_id: int,
-    entry: schemas.ScheduleEntryUpdate,
-    ignore_faculty: bool = False,
-    ignore_room: bool = False,
-    ignore_tba: bool = False,
-    ignore_faculty_list: str | None = None,
-    ignore_room_list: str | None = None,
-    contains_faculty: bool = False,
-    contains_room: bool = False,
-    db: Session = Depends(get_db),
-):
-    if time_utils.is_tba(entry.time_lpu) or time_utils.is_tba(entry.days):
-        normalized_lpu = "TBA"
-        start_minutes = None
-        end_minutes = None
-        normalized_days = "TBA"
+@api.post("/auth/login")
+def login(payload: Credentials, request: Request, response: Response, db: Session = Db):
+    auth.lock(db)
+    username = payload.username.strip().casefold()
+    # Do not trust arbitrary forwarded headers as client identities. Account and
+    # direct peer limits protect login even when the tunnel shares an origin IP.
+    keys = [auth.digest("account:" + username), auth.digest("peer:" + (request.client.host if request.client else "unknown"))]
+    attempts = []
+    for key in keys:
+        row = db.get(models.LoginAttempt, key)
+        if not row:
+            row = models.LoginAttempt(key=key, attempts=0, window_start=auth.now())
+            db.add(row)
+        elif auth.aware(row.window_start) < auth.now() - timedelta(minutes=15):
+            row.attempts, row.window_start = 0, auth.now()
+        attempts.append(row)
+    if attempts[0].attempts >= 10 or attempts[1].attempts >= 100:
+        raise HTTPException(429, "Too many sign-in attempts. Try again in 15 minutes.")
+    user = db.scalar(select(models.User).where(models.User.username == username))
+    valid = auth.verify_password(payload.password, user.password_hash if user else DUMMY_PASSWORD)
+    if not user or user.disabled or not valid:
+        for row in attempts:
+            row.attempts += 1
+        auth.audit(db, None, "login_failed", "authentication", security=True)
+        db.commit()
+        raise HTTPException(401, "Invalid username or password")
+    attempts[0].attempts = 0
+    token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+    db.execute(delete(models.LoginSession).where(models.LoginSession.expires_at < auth.now()))
+    session = models.LoginSession(token_hash=auth.digest(token), user_id=user.id, csrf_token=csrf,
+        expires_at=auth.now() + timedelta(hours=12), last_seen=auth.now())
+    db.add(session)
+    auth.audit(db, user, "logged_in", "authentication", security=True)
+    db.commit()
+    response.set_cookie(auth.COOKIE, token, httponly=True, secure=os.getenv("COOKIE_SECURE", "true").lower() == "true",
+        samesite="lax", max_age=43200, path="/api")
+    return {"user": auth.user_json(user), "csrf_token": csrf}
+
+
+DUMMY_PASSWORD = auth.password_hash(secrets.token_urlsafe(32))
+
+
+@api.get("/auth/me")
+def me(request: Request, user=User):
+    return {"user": auth.user_json(user), "csrf_token": request.state.session.csrf_token}
+
+
+@api.post("/auth/logout")
+def logout(request: Request, response: Response, db: Session = Db, user=User):
+    db.delete(request.state.session)
+    auth.audit(db, user, "logged_out", "authentication", security=True)
+    db.commit()
+    response.delete_cookie(auth.COOKIE, path="/api")
+    return {"ok": True}
+
+
+@api.post("/auth/password")
+def change_password(payload: PasswordChange, request: Request, response: Response, db: Session = Db, user=User):
+    if not auth.verify_password(payload.current_password, user.password_hash):
+        raise HTTPException(403, "Current password is incorrect")
+    user.password_hash = auth.password_hash(payload.password)
+    user.must_change_password = False
+    auth.revoke(db, user.id)
+    auth.audit(db, user, "password_changed", "authentication", security=True)
+    db.commit()
+    response.delete_cookie(auth.COOKIE, path="/api")
+    return {"ok": True, "sign_in_again": True}
+
+
+@api.get("/admin/users")
+def users(db: Session = Db, user=Admin):
+    return [auth.user_json(item) for item in db.scalars(select(models.User).order_by(models.User.username))]
+
+
+@api.post("/admin/users")
+def create_user(payload: UserCreate, db: Session = Db, user=Admin):
+    item = models.User(username=service.label(payload.username).casefold(), password_hash=auth.password_hash(payload.password),
+        is_admin=payload.is_admin, disabled=False, must_change_password=True)
+    db.add(item)
+    db.flush()
+    auth.audit(db, user, "created", "user", item.id, after=auth.user_json(item))
+    db.commit()
+    return auth.user_json(item)
+
+
+@api.put("/admin/users/{user_id}")
+def update_user(user_id: int, payload: UserUpdate, db: Session = Db, user=Admin):
+    item = db.get(models.User, user_id)
+    if not item:
+        raise HTTPException(404, "User not found")
+    if item.id == user.id and payload.disabled:
+        raise HTTPException(409, "You cannot disable your own account")
+    before = auth.user_json(item)
+    if payload.disabled is not None:
+        item.disabled = payload.disabled
+    if payload.password:
+        item.password_hash = auth.password_hash(payload.password)
+        item.must_change_password = True
+    auth.revoke(db, item.id)
+    auth.audit(db, user, "password_reset" if payload.password else "updated", "user", item.id,
+               before=before, after=auth.user_json(item))
+    db.commit()
+    return auth.user_json(item)
+
+
+@api.get("/programs")
+def programs(db: Session = Db, user=User):
+    return [program_json(p) for p in db.scalars(select(models.Program).order_by(models.Program.name))]
+
+
+def assigned_user(db, user_id):
+    if user_id is not None:
+        item = db.get(models.User, user_id)
+        if not item or item.disabled:
+            raise HTTPException(422, "Assign an enabled user")
+
+
+@api.post("/admin/programs")
+def create_program(payload: ProgramCreate, db: Session = Db, user=Admin):
+    assigned_user(db, payload.assigned_user_id)
+    item = models.Program(name=service.label(payload.name), assigned_user_id=payload.assigned_user_id)
+    db.add(item)
+    db.flush()
+    auth.audit(db, user, "created", "program", item.id, item.id, after=program_json(item))
+    db.commit()
+    return program_json(item)
+
+
+@api.put("/admin/programs/{program_id}")
+def assign_program(program_id: int, payload: ProgramUpdate, db: Session = Db, user=Admin):
+    item = require_program(db, program_id)
+    auth.check_version(item, payload.version)
+    assigned_user(db, payload.assigned_user_id)
+    before = program_json(item)
+    item.assigned_user_id, item.version = payload.assigned_user_id, item.version + 1
+    auth.audit(db, user, "assigned", "program", item.id, item.id, before, program_json(item))
+    db.commit()
+    return program_json(item)
+
+
+@api.get("/schedule", response_model=list[schemas.ScheduleEntry])
+def list_schedule(program_id: int | None = None, section: str | None = None, faculty: str | None = None,
+                  room: str | None = None, db: Session = Db, user=User):
+    query = select(models.ScheduleEntry).order_by(models.ScheduleEntry.id)
+    for field, value in (("program_id", program_id), ("section", section), ("faculty", faculty), ("room", room)):
+        if value is not None:
+            query = query.where(getattr(models.ScheduleEntry, field) == value)
+    return list(db.scalars(query))
+
+
+@api.get("/schedule/{entry_id}", response_model=schemas.ScheduleEntry)
+def get_schedule(entry_id: int, db: Session = Db, user=User):
+    item = db.get(models.ScheduleEntry, entry_id)
+    if not item:
+        raise HTTPException(404, "Schedule entry not found")
+    return item
+
+
+@api.post("/schedule", response_model=schemas.ScheduleEntry)
+def create_schedule(payload: schemas.ScheduleEntryCreate, override_reason: str | None = None, db: Session = Db, user=User):
+    item = service.save(db, user, payload, override_reason=override_reason)
+    db.commit()
+    return item
+
+
+@api.put("/schedule/{entry_id}", response_model=schemas.ScheduleEntry)
+def update_schedule(entry_id: int, payload: schemas.ScheduleEntryUpdate, override_reason: str | None = None, db: Session = Db, user=User):
+    item = service.save(db, user, payload, entry_id, override_reason)
+    db.commit()
+    return item
+
+
+@api.delete("/schedule/{entry_id}")
+def delete_schedule(entry_id: int, version: int, db: Session = Db, user=User):
+    item = db.get(models.ScheduleEntry, entry_id)
+    if not item:
+        raise HTTPException(404, "Schedule entry not found")
+    service.remove(db, user, item, version)
+    db.commit()
+    return {"ok": True}
+
+
+@api.post("/schedule/{entry_id}/move-check")
+def move_check(entry_id: int, payload: schemas.ScheduleEntryCreate, db: Session = Db, user=User):
+    if entry_id:
+        old = db.get(models.ScheduleEntry, entry_id)
+        if not old:
+            raise HTTPException(404, "Schedule entry not found")
+        auth.editable(db, user, old.program_id)
+    candidate = service.build_candidate(db, user, payload)
+    found = service.candidate_conflicts(db, candidate, entry_id)
+    return {"ok": not found, "reason": "conflict" if found else None, "conflicts": found}
+
+
+ENTITY_TYPES = {"sections": models.Section, "faculty": models.Faculty, "rooms": models.Room}
+
+
+def entity_class(kind):
+    if kind not in ENTITY_TYPES:
+        raise HTTPException(404, "Unknown catalog")
+    return ENTITY_TYPES[kind]
+
+
+@api.get("/catalog/{kind}")
+def list_entities(kind: str, program_id: int | None = None, db: Session = Db, user=User):
+    cls = entity_class(kind)
+    query = select(cls).order_by(cls.name)
+    if cls is models.Section and program_id is not None:
+        query = query.where(cls.program_id == program_id)
+    return [service.entity_json(item) for item in db.scalars(query)]
+
+
+@api.post("/catalog/{kind}")
+def create_entity(kind: str, payload: EntityPayload, db: Session = Db, user=User):
+    cls = entity_class(kind)
+    if cls is models.Section:
+        auth.editable(db, user, require_program(db, payload.program_id).id)
+    name = service.label(payload.name)
+    if cls is not models.Section and service.normalized(name) == "tba":
+        raise HTTPException(422, "TBA is an unassigned resource")
+    query = select(cls).where(cls.normalized_name == service.normalized(name))
+    if cls is models.Section:
+        query = query.where(cls.program_id == payload.program_id)
+    if db.scalar(query):
+        raise HTTPException(409, "That name already exists")
+    item = service.resolve(db, cls, name, payload.program_id, create=True)
+    auth.audit(db, user, "created", kind, item.id, payload.program_id if cls is models.Section else None,
+               after=service.entity_json(item))
+    db.commit()
+    return service.entity_json(item)
+
+
+@api.put("/catalog/{kind}/{entity_id}")
+def update_entity(kind: str, entity_id: int, payload: EntityPayload, merge: bool = False, db: Session = Db, user=User):
+    cls = entity_class(kind)
+    item = db.get(cls, entity_id)
+    if not item:
+        raise HTTPException(404, "Record not found")
+    if cls is models.Section:
+        auth.editable(db, user, item.program_id)
+    elif not user.is_admin:
+        raise HTTPException(403, "Only administrators can rename or merge shared resources")
+    auth.check_version(item, payload.version)
+    name = service.label(payload.name)
+    if cls is not models.Section and service.normalized(name) == "tba":
+        raise HTTPException(422, "TBA is an unassigned resource")
+    before = service.entity_json(item)
+    field = {"sections": "section", "faculty": "faculty", "rooms": "room"}[kind]
+    affected = list(db.scalars(select(models.ScheduleEntry).where(getattr(models.ScheduleEntry, field + "_id") == item.id)))
+    target = service.resolve(db, cls, name, item.program_id if cls is models.Section else None, False) if merge else item
+    if merge and cls is models.Section:
+        raise HTTPException(422, "Sections cannot be merged")
+    for entry in affected:
+        old = service.serialize(entry)
+        setattr(entry, field, target.name if merge else name)
+        setattr(entry, field + "_id", target.id)
+        entry.version += 1
+        # Flush before checking every changed row; the whole operation rolls back on conflict.
+        db.flush()
+        service.validate_conflicts(db, user, entry, entry.id)
+        auth.audit(db, user, "updated", "schedule", entry.id, entry.program_id, old, service.serialize(entry))
+    if merge and target.id != item.id:
+        db.delete(item)
     else:
-        try:
-            normalized_lpu, _time_24, start_minutes, end_minutes = time_utils.parse_time_lpu(
-                entry.time_lpu
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        normalized_days = time_utils.normalize_days_string(entry.days)
-        if not normalized_days:
-            raise HTTPException(status_code=422, detail="Invalid Days. Example: M,W,F")
+        item.name, item.normalized_name, item.version = name, service.normalized(name), item.version + 1
+    auth.audit(db, user, "merged" if merge else "renamed", kind, entity_id,
+               item.program_id if cls is models.Section else None, before, service.entity_json(target))
+    db.commit()
+    return service.entity_json(target)
 
-    candidate = SimpleNamespace(
-        time_lpu=normalized_lpu,
-        days=normalized_days,
-        start_minutes=start_minutes,
-        end_minutes=end_minutes,
-        section=entry.section,
-        room=entry.room,
-        faculty=entry.faculty,
-    )
-    faculty_list = ignore_faculty_list.split(",") if ignore_faculty_list else []
-    room_list = ignore_room_list.split(",") if ignore_room_list else []
-    conflicts_list = conflicts.conflicts_for_candidate(
-        db,
-        entry_id,
-        candidate,
-        ignore_faculty=ignore_faculty,
-        ignore_room=ignore_room,
-        ignore_tba=ignore_tba,
-        ignore_faculty_list=faculty_list,
-        ignore_room_list=room_list,
-        contains_faculty=contains_faculty,
-        contains_room=contains_room,
-    )
-    if conflicts_list:
-        return {
-            "ok": False,
-            "reason": "conflict",
-            "conflicts": [
-                {
-                    "conflict_type": conflict["conflict_type"],
-                    "entry": schemas.ScheduleEntry.from_orm(conflict["entry"]).model_dump(
-                        by_alias=True
-                    ),
-                }
-                for conflict in conflicts_list
-            ],
-        }
+
+@api.delete("/catalog/{kind}/{entity_id}")
+def delete_entity(kind: str, entity_id: int, version: int, force: bool = False, db: Session = Db, user=User):
+    cls = entity_class(kind)
+    item = db.get(cls, entity_id)
+    if not item:
+        raise HTTPException(404, "Record not found")
+    if cls is models.Section:
+        auth.editable(db, user, item.program_id)
+    elif not user.is_admin:
+        raise HTTPException(403, "Only administrators can delete shared resources")
+    auth.check_version(item, version)
+    field = {"sections": "section_id", "faculty": "faculty_id", "rooms": "room_id"}[kind]
+    entries = list(db.scalars(select(models.ScheduleEntry).where(getattr(models.ScheduleEntry, field) == item.id)))
+    if entries and not force:
+        raise HTTPException(409, "Record has scheduled classes")
+    # Shared resources are never force-deleted with other programs' schedules.
+    if entries and cls is not models.Section:
+        raise HTTPException(409, "Remove resource assignments before deleting a shared resource")
+    for entry in entries:
+        service.remove(db, user, entry, entry.version)
+    auth.audit(db, user, "deleted", kind, item.id, item.program_id if cls is models.Section else None,
+               before=service.entity_json(item))
+    db.delete(item)
+    db.commit()
     return {"ok": True}
 
 
-@app.get("/sections", response_model=List[schemas.NamedEntity])
-def list_sections(db: Session = Depends(get_db)):
-    return crud.list_named_entities(db, models.Section)
+# Explicit aliases retain the local UI's list operations without exposing legacy routes.
+for kind in ENTITY_TYPES:
+    def install_alias(kind):
+        @api.get(f"/{kind}")
+        def get_alias(program_id: int | None = None, db: Session = Db, user=User):
+            return list_entities(kind, program_id, db, user)
+        @api.post(f"/{kind}")
+        def post_alias(payload: EntityPayload, db: Session = Db, user=User):
+            return create_entity(kind, payload, db, user)
+        @api.put(f"/{kind}/{{entity_id}}")
+        def put_alias(entity_id: int, payload: EntityPayload, merge: bool = False, db: Session = Db, user=User):
+            return update_entity(kind, entity_id, payload, merge, db, user)
+        @api.delete(f"/{kind}/{{entity_id}}")
+        def delete_alias(entity_id: int, version: int, force: bool = False, db: Session = Db, user=User):
+            return delete_entity(kind, entity_id, version, force, db, user)
+        @api.post(f"/{kind}/{{entity_id}}/remove")
+        def remove_alias(entity_id: int, version: int, force: bool = False, db: Session = Db, user=User):
+            return delete_entity(kind, entity_id, version, force, db, user)
+    install_alias(kind)
 
 
-@app.post("/sections", response_model=schemas.NamedEntity)
-def create_section(payload: schemas.NamedEntityCreate, db: Session = Depends(get_db)):
-    return crud.create_named_entity(db, models.Section, payload.name)
+@api.get("/conflicts")
+def conflicts(db: Session = Db, user=User):
+    return {"conflicts": service.all_conflicts(db)}
 
 
-@app.put("/sections/{section_id}", response_model=schemas.NamedEntity)
-def update_section(
-    section_id: int, payload: schemas.NamedEntityCreate, db: Session = Depends(get_db)
-):
+@api.get("/settings")
+def get_settings(program_id: int | None = None, db: Session = Db, user=User):
+    settings = json.loads(user.preferences_json)
+    version = None
+    if program_id is not None:
+        program = require_program(db, program_id)
+        settings.update(json.loads(program.settings_json))
+        version = program.version
+    instance = db.get(models.AppSettings, 1)
+    settings["conflictIgnore"] = json.loads(instance.settings_json) if instance else {}
+    return {"settings": settings, "version": version}
+
+
+@api.put("/settings")
+def put_settings(payload: dict, program_id: int | None = None, db: Session = Db, user=User):
+    settings = payload.get("settings", {})
+    if not isinstance(settings, dict):
+        raise HTTPException(422, "Invalid settings")
+    if "curriculumState" in settings:
+        program = auth.editable(db, user, require_program(db, program_id).id)
+        auth.check_version(program, payload.get("version"))
+        state = settings["curriculumState"]
+        if not isinstance(state, dict):
+            raise HTTPException(422, "Invalid curriculum")
+        for curriculum in state.get("curricula", []):
+            for course in curriculum.get("courses", []):
+                if course.get("program") != program.name:
+                    raise HTTPException(403, "Curriculum contains a different program")
+        old = json.loads(program.settings_json)
+        program.settings_json = json.dumps({"curriculumState": state})
+        program.version += 1
+        auth.audit(db, user, "updated", "curriculum", program.id, program.id, old, {"curriculumState": state})
+    if "customize" in settings:
+        user.preferences_json = json.dumps({"customize": settings["customize"]})
+    # Conflict-ignore switches are presentation-only in the online UI and cannot
+    # disable mandatory server booking checks. Global rules have their own API.
+    db.commit()
+    return get_settings(program_id, db, user)
+
+
+@api.get("/admin/rules")
+def get_rules(db: Session = Db, user=Admin):
+    item = db.get(models.AppSettings, 1)
+    return {"rules": json.loads(item.settings_json) if item else {}, "policy": "block", "section_override": False}
+
+
+@api.post("/file/import-csv")
+async def import_csv(file: UploadFile = File(...), program_id: int | None = None, replace: bool = False,
+                     preview: bool = False, db: Session = Db, user=User):
+    program = auth.editable(db, user, require_program(db, program_id).id)
+    raw = await file.read(5 * 1024 * 1024 + 1)
+    if len(raw) > 5 * 1024 * 1024:
+        raise HTTPException(413, "CSV limit is 5 MB")
     try:
-        return crud.update_named_entity(db, models.Section, section_id, payload.name)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.delete("/sections/{section_id}")
-def delete_section(section_id: int, force: bool = False, db: Session = Depends(get_db)):
-    try:
-        crud.delete_named_entity(db, models.Section, section_id, force=force)
-    except ValueError as exc:
-        status_code = 409 if str(exc) == "Section has scheduled classes" else 404
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
-    return {"ok": True}
-
-
-@app.post("/sections/{section_id}/remove")
-def remove_section(section_id: int, force: bool = False, db: Session = Depends(get_db)):
-    return delete_section(section_id, force=force, db=db)
-
-
-@app.get("/faculty", response_model=List[schemas.NamedEntity])
-def list_faculty(db: Session = Depends(get_db)):
-    return crud.list_named_entities(db, models.Faculty)
-
-
-@app.post("/faculty", response_model=schemas.NamedEntity)
-def create_faculty(payload: schemas.NamedEntityCreate, db: Session = Depends(get_db)):
-    return crud.create_named_entity(db, models.Faculty, payload.name)
-
-
-@app.put("/faculty/{faculty_id}", response_model=schemas.NamedEntity)
-def update_faculty(
-    faculty_id: int,
-    payload: schemas.NamedEntityCreate,
-    merge: bool = False,
-    db: Session = Depends(get_db),
-):
-    try:
-        if merge:
-            return crud.merge_named_entity(db, models.Faculty, faculty_id, payload.name)
-        return crud.update_named_entity(db, models.Faculty, faculty_id, payload.name)
-    except ValueError as exc:
-        status_code = 409 if "conflicts" in str(exc) else 404
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
-
-
-@app.delete("/faculty/{faculty_id}")
-def delete_faculty(faculty_id: int, force: bool = False, db: Session = Depends(get_db)):
-    try:
-        crud.delete_named_entity(db, models.Faculty, faculty_id, force=force)
-    except ValueError as exc:
-        status_code = 409 if str(exc) == "Faculty has scheduled classes" else 404
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
-    return {"ok": True}
-
-
-@app.post("/faculty/{faculty_id}/remove")
-def remove_faculty(faculty_id: int, force: bool = False, db: Session = Depends(get_db)):
-    return delete_faculty(faculty_id, force=force, db=db)
-
-
-@app.get("/rooms", response_model=List[schemas.NamedEntity])
-def list_rooms(db: Session = Depends(get_db)):
-    return crud.list_named_entities(db, models.Room)
-
-
-@app.post("/rooms", response_model=schemas.NamedEntity)
-def create_room(payload: schemas.NamedEntityCreate, db: Session = Depends(get_db)):
-    return crud.create_named_entity(db, models.Room, payload.name)
-
-
-@app.put("/rooms/{room_id}", response_model=schemas.NamedEntity)
-def update_room(
-    room_id: int,
-    payload: schemas.NamedEntityCreate,
-    merge: bool = False,
-    db: Session = Depends(get_db),
-):
-    try:
-        if merge:
-            return crud.merge_named_entity(db, models.Room, room_id, payload.name)
-        return crud.update_named_entity(db, models.Room, room_id, payload.name)
-    except ValueError as exc:
-        status_code = 409 if "conflicts" in str(exc) else 404
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
-
-
-@app.delete("/rooms/{room_id}")
-def delete_room(room_id: int, force: bool = False, db: Session = Depends(get_db)):
-    try:
-        crud.delete_named_entity(db, models.Room, room_id, force=force)
-    except ValueError as exc:
-        status_code = 409 if str(exc) == "Room has scheduled classes" else 404
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
-    return {"ok": True}
-
-
-@app.post("/rooms/{room_id}/remove")
-def remove_room(room_id: int, force: bool = False, db: Session = Depends(get_db)):
-    return delete_room(room_id, force=force, db=db)
-
-
-@app.get("/conflicts", response_model=schemas.ConflictReport)
-def list_conflicts(
-    ignore_faculty: bool = False,
-    ignore_room: bool = False,
-    ignore_tba: bool = False,
-    ignore_faculty_list: str | None = None,
-    ignore_room_list: str | None = None,
-    contains_faculty: bool = False,
-    contains_room: bool = False,
-    db: Session = Depends(get_db),
-):
-    faculty_list = ignore_faculty_list.split(",") if ignore_faculty_list else []
-    room_list = ignore_room_list.split(",") if ignore_room_list else []
-    conflicts_list = conflicts.find_conflicts(
-        db,
-        ignore_faculty=ignore_faculty,
-        ignore_room=ignore_room,
-        ignore_tba=ignore_tba,
-        ignore_faculty_list=faculty_list,
-        ignore_room_list=room_list,
-        contains_faculty=contains_faculty,
-        contains_room=contains_room,
-    )
-    grouped = {}
-    for conflict in conflicts_list:
-        grouped.setdefault((conflict["entry_id"], conflict["conflict_type"]), []).append(
-            conflict["conflicts_with"]
-        )
-    response = [
-        schemas.ConflictSummary(
-            entry_id=entry_id,
-            conflicts_with=conflict_ids,
-            conflict_type=conflict_type,
-        )
-        for (entry_id, conflict_type), conflict_ids in grouped.items()
-    ]
-    return schemas.ConflictReport(conflicts=response)
-
-
-@app.get("/reports/text.csv")
-def export_text_csv(db: Session = Depends(get_db)):
-    entries = [
-        schemas.ScheduleEntry.from_orm(entry).model_dump(by_alias=True)
-        for entry in crud.list_schedule_entries(db)
-    ]
-    rows = reports.build_text_rows(entries)
-    content = reports.write_csv(rows)
-    return Response(content, media_type="text/csv")
-
-
-@app.get("/settings", response_model=schemas.AppSettingsPayload)
-def get_settings(db: Session = Depends(get_db)):
-    instance = crud.get_app_settings(db)
-    if instance is None:
-        return schemas.AppSettingsPayload(settings={})
-    return schemas.AppSettingsPayload(settings=json.loads(instance.settings_json))
-
-
-@app.put("/settings", response_model=schemas.AppSettingsPayload)
-def update_settings(payload: schemas.AppSettingsPayload, db: Session = Depends(get_db)):
-    instance = crud.set_app_settings(db, json.dumps(payload.settings))
-    return schemas.AppSettingsPayload(settings=json.loads(instance.settings_json))
-
-
-def filter_entries(entries, group: str, filter_value: str | None):
-    if group not in {"section", "faculty", "room"}:
-        raise HTTPException(status_code=400, detail="Invalid group")
-    if group == "section":
-        if filter_value:
-            entries = [e for e in entries if e["Section"] == filter_value]
-    elif group == "faculty":
-        if filter_value:
-            entries = [e for e in entries if e["Faculty"] == filter_value]
-    elif group == "room":
-        if filter_value:
-            entries = [e for e in entries if e["Room"] == filter_value]
-    return entries
-
-
-@app.get("/reports/timetable/{group}.csv")
-def export_timetable_csv(group: str, filter_value: str | None = None, db: Session = Depends(get_db)):
-    entries = [
-        schemas.ScheduleEntry.from_orm(entry).model_dump(by_alias=True)
-        for entry in crud.list_schedule_entries(db)
-    ]
-    entries = filter_entries(entries, group, filter_value)
-    rows = reports.build_text_rows(entries)
-    content = reports.write_csv(rows)
-    return Response(content, media_type="text/csv")
-
-
-@app.get("/reports/faculty-load.html")
-def export_faculty_load(faculty: str, db: Session = Depends(get_db)):
-    faculty_name = faculty.strip()
-    if not faculty_name:
-        raise HTTPException(status_code=400, detail="Faculty is required")
-    entries = [
-        schemas.ScheduleEntry.from_orm(entry).model_dump(by_alias=True)
-        for entry in crud.list_schedule_entries(db)
-        if entry.faculty == faculty_name
-    ]
-    content = reports.build_faculty_load_html(faculty_name, entries)
-    safe_name = "".join(char if char.isalnum() or char in "-_" else "_" for char in faculty_name)
-    return Response(
-        content,
-        media_type="text/html",
-        headers={"Content-Disposition": f'attachment; filename="faculty-load-{safe_name}.html"'},
-    )
-
-
-@app.post("/file/import")
-def import_database(file: UploadFile = File(...)):
-    target = DATABASE_PATH
-    temp_path = target.with_suffix(".upload")
-    try:
-        with temp_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        try:
-            uploaded_db = sqlite3.connect(temp_path)
-            try:
-                integrity = uploaded_db.execute("PRAGMA integrity_check").fetchone()
-                if not integrity or integrity[0] != "ok":
-                    raise sqlite3.DatabaseError("SQLite integrity check failed")
-                schedule_table = uploaded_db.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schedule_entries'"
-                ).fetchone()
-                if not schedule_table:
-                    raise sqlite3.DatabaseError("Missing schedule_entries table")
-            finally:
-                uploaded_db.close()
-        except sqlite3.DatabaseError as exc:
-            raise HTTPException(status_code=400, detail="The selected file is not a valid timetable database") from exc
-
-        # On Unix/macOS, open SQLite connections continue pointing at the old inode
-        # after a file replacement. Close the pool before and after the atomic swap.
-        engine.dispose()
-        os.replace(temp_path, target)
-        engine.dispose()
-        models.Base.metadata.create_all(bind=engine)
-        with SessionLocal() as db:
-            crud.remove_unused_placeholder_entities(db)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink()
-    return {"ok": True}
-
-
-@app.post("/file/import-csv")
-def import_csv(
-    file: UploadFile = File(...),
-    replace: bool = False,
-    preview: bool = False,
-    db: Session = Depends(get_db),
-):
-    payload = file.file.read()
-    try:
-        decoded = payload.decode("utf-8-sig")
+        decoded = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
-        decoded = payload.decode("cp1252", errors="replace")
-    text_stream = io.StringIO(decoded)
-    reader = csv.reader(text_stream)
-    header_row = next(reader, [])
-
-    header_map = {}
-    required_map = {
-        "program": "Program",
-        "section": "Section",
-        "course code": "Course Code",
-        "course description": "Course Description",
-        "units": "Units",
-        "# of hours": "# of Hours",
-        "time (lpu std)": "Time (LPU Std)",
-        "time (24 hrs)": "Time (24 Hrs)",
-        "days": "Days",
-        "room": "Room",
-        "faculty": "Faculty",
-    }
-    for idx, header in enumerate(header_row):
-        cleaned = header.strip()
-        if not cleaned or cleaned.lower().startswith("unnamed"):
-            continue
-        key = required_map.get(cleaned.lower())
-        if key:
-            header_map[key] = idx
-
-    required_headers = [
-        "Program",
-        "Section",
-        "Course Code",
-        "Course Description",
-        "Units",
-        "# of Hours",
-        "Time (LPU Std)",
-        "Days",
-        "Room",
-        "Faculty",
-    ]
-    missing = [header for header in required_headers if header not in header_map]
-    rows_total = 0
-    rows_imported = 0
-    rows_skipped = 0
-    errors = []
-
+        decoded = raw.decode("cp1252")
+    reader = csv.DictReader(io.StringIO(decoded))
+    headers = {h.strip().casefold(): h for h in (reader.fieldnames or []) if h}
+    required = [h for h in schemas.CANONICAL_HEADERS if h != "Time (24 Hrs)"]
+    missing = [h for h in required if h.casefold() not in headers]
+    summary = {"rows_total": 0, "rows_imported": 0, "rows_skipped": 0, "missing_columns": missing, "errors": []}
     if missing:
-        return {
-            "rows_total": 0,
-            "rows_imported": 0,
-            "rows_skipped": 0,
-            "missing_columns": missing,
-            "errors": [{"row_index": 0, "reason": "Missing required columns"}],
-        }
-
-    if replace and not preview:
-        db.query(models.ScheduleEntry).delete()
-        db.commit()
-
-    sections = {section.name.lower(): section for section in db.scalars(select(models.Section))}
-    faculty = {item.name.lower(): item for item in db.scalars(select(models.Faculty))}
-    rooms = {item.name.lower(): item for item in db.scalars(select(models.Room))}
-
-    def ensure_entity(name: str, collection: dict, model_cls):
-        key = name.lower()
-        instance = collection.get(key)
-        if instance:
-            return instance
-        instance = model_cls(name=name)
-        db.add(instance)
-        collection[key] = instance
-        return instance
-
-    for idx, row in enumerate(reader, start=2):
-        rows_total += 1
-        try:
-            def get_value(header: str) -> str:
-                value = row[header_map[header]] if header_map.get(header) is not None and len(row) > header_map[header] else ""
-                return value.strip()
-
-            program = get_value("Program")
-            section = get_value("Section")
-            course_code = get_value("Course Code")
-            course_description = get_value("Course Description")
-            units = get_value("Units")
-            hours = get_value("# of Hours")
-            time_lpu = get_value("Time (LPU Std)")
-            days = get_value("Days")
-            room = get_value("Room")
-            faculty_name = get_value("Faculty")
-
-            if time_utils.is_tba(time_lpu) or time_utils.is_tba(days):
-                normalized_lpu = "TBA"
-                normalized_days = "TBA"
-                time_24 = None
-                start_minutes = None
-                end_minutes = None
-            else:
-                normalized_lpu, time_24, start_minutes, end_minutes = time_utils.parse_time_lpu(
-                    time_lpu
-                )
-                normalized_days = time_utils.normalize_days_string(days)
-                if not normalized_days:
-                    raise ValueError("Invalid Days. Example: M,W,F")
-
-            if not preview:
-                ensure_entity(section, sections, models.Section)
-                ensure_entity(faculty_name, faculty, models.Faculty)
-                ensure_entity(room, rooms, models.Room)
-
-                entry = models.ScheduleEntry(
-                    program=program,
-                    section=section,
-                    course_code=course_code,
-                    course_description=course_description,
-                    units=float(units) if units else 0,
-                    hours=float(hours) if hours else 0,
-                    time_lpu=normalized_lpu,
-                    time_24=time_24,
-                    days=normalized_days,
-                    room=room,
-                    faculty=faculty_name,
-                    start_minutes=start_minutes,
-                    end_minutes=end_minutes,
-                )
-                db.add(entry)
-            rows_imported += 1
-        except ValueError as exc:
-            rows_skipped += 1
-            errors.append({"row_index": idx, "reason": str(exc)})
-
-    if not preview:
-        db.commit()
-        crud.remove_unused_placeholder_entities(db)
-
-    return {
-        "rows_total": rows_total,
-        "rows_imported": rows_imported,
-        "rows_skipped": rows_skipped,
-        "missing_columns": [],
-        "errors": errors,
-    }
+        raise HTTPException(422, summary)
+    # The outer request transaction owns the advisory lock. A savepoint allows
+    # preview rollback while retaining that lock and checking rows against rows.
+    with db.begin_nested() as batch:
+        if replace:
+            for entry in list(db.scalars(select(models.ScheduleEntry).where(models.ScheduleEntry.program_id == program.id))):
+                service.remove(db, user, entry, entry.version)
+            db.flush()
+        for index, row in enumerate(reader, start=2):
+            summary["rows_total"] += 1
+            if summary["rows_total"] > 10000:
+                raise HTTPException(413, "CSV limit is 10,000 rows")
+            values = {h: (row.get(headers.get(h.casefold(), "")) or "").strip() for h in schemas.CANONICAL_HEADERS}
+            try:
+                if values["Program"] != program.name:
+                    raise HTTPException(403, "Every CSV row must belong to the selected program")
+                values["Units"] = float(values["Units"] or 0)
+                values["# of Hours"] = float(values["# of Hours"] or 0)
+                payload = schemas.ScheduleEntryCreate.model_validate(values)
+                service.save(db, user, payload, allow_catalog_add=True)
+                summary["rows_imported"] += 1
+            except (ValueError, HTTPException) as exc:
+                summary["errors"].append({"row_index": index, "reason": str(exc.detail if isinstance(exc, HTTPException) else exc)})
+                # Stop at the first invalid row: no partially valid replacement.
+                summary["rows_imported"] = 0
+                summary["rows_skipped"] = summary["rows_total"]
+                batch.rollback()
+                if preview:
+                    return summary
+                raise HTTPException(422, summary) from exc
+        if preview:
+            batch.rollback()
+        elif not summary["rows_total"]:
+            batch.rollback()
+            raise HTTPException(422, "Empty CSV cannot replace a timetable; use Clear program")
+        else:
+            auth.audit(db, user, "imported", "csv", program_id=program.id, after={"rows": summary["rows_imported"], "replace": replace})
+    db.commit()
+    return summary
 
 
-@app.get("/file/export")
-def export_database():
-    if not DATABASE_PATH.exists():
-        raise HTTPException(status_code=404, detail="Database not found")
-    return FileResponse(path=DATABASE_PATH, filename="scheduler.db")
-
-
-@app.post("/file/reset")
-def reset_database(db: Session = Depends(get_db)):
-    models.Base.metadata.drop_all(bind=engine)
-    models.Base.metadata.create_all(bind=engine)
+@api.post("/file/reset")
+def clear_program(program_id: int, db: Session = Db, user=User):
+    auth.editable(db, user, program_id)
+    for entry in list(db.scalars(select(models.ScheduleEntry).where(models.ScheduleEntry.program_id == program_id))):
+        service.remove(db, user, entry, entry.version)
+    auth.audit(db, user, "cleared", "program_schedule", program_id, program_id)
+    db.commit()
     return {"ok": True}
 
 
-@app.post("/export/png")
-def export_png(payload: dict):
-    category = payload.get("category")
-    name = payload.get("name")
-    png_base64 = payload.get("png_base64")
-    batch_id = payload.get("batch_id") or uuid4().hex
-    if category not in {"faculty", "section", "room"}:
-        raise HTTPException(status_code=400, detail="Invalid category")
-    if not name or not png_base64:
-        raise HTTPException(status_code=400, detail="Missing export data")
-    if "," in png_base64:
-        png_base64 = png_base64.split(",", 1)[1]
+@api.api_route("/file/import", methods=["POST"])
+@api.api_route("/file/export", methods=["GET"])
+def database_files(user=User):
+    raise HTTPException(410, "Database-file Open/Save is unavailable online. Use CSV exports or server backups.")
+
+
+@api.get("/reports/text.csv")
+@api.get("/reports/timetable/{group}.csv")
+def csv_export(group: str = "section", program_id: int | None = None, filter_value: str | None = None, db: Session = Db, user=User):
+    if group not in {"section", "faculty", "room"}:
+        raise HTTPException(422, "Invalid group")
+    entries = list_schedule(program_id, db=db, user=user)
+    if filter_value:
+        entries = [entry for entry in entries if getattr(entry, group) == filter_value]
+    content = reports.write_csv(reports.build_text_rows([service.serialize(e) for e in entries]))
+    return Response(content, media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="schedule.csv"'})
+
+
+@api.get("/reports/faculty-load.html")
+def faculty_export(faculty: str, db: Session = Db, user=User):
+    entries = list_schedule(faculty=faculty, db=db, user=user)
+    return Response(reports.build_faculty_load_html(faculty, [service.serialize(e) for e in entries]), media_type="text/html",
+        headers={"Content-Disposition": 'attachment; filename="faculty-load.html"'})
+
+
+@api.post("/export/png")
+def png_export(payload: dict, user=User):
+    import base64
+    import binascii
+    encoded = str(payload.get("png_base64", "")).split(",")[-1]
+    if len(encoded) > 14 * 1024 * 1024:
+        raise HTTPException(413, "PNG too large")
     try:
-        data = base64.b64decode(png_base64)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Invalid PNG payload") from exc
-
-    folder_map = {
-        "faculty": "Timetables_Faculty",
-        "section": "Timetables_Section",
-        "room": "Timetables_Room",
-    }
-    base_dir = Path.cwd() / "exports" / batch_id / folder_map[category]
-    base_dir.mkdir(parents=True, exist_ok=True)
-    file_path = base_dir / f"{name}.png"
-    file_path.write_bytes(data)
-    return {"ok": True, "path": str(file_path)}
+        data = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        raise HTTPException(422, "Invalid PNG")
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise HTTPException(422, "Invalid PNG")
+    return Response(data, media_type="image/png", headers={"Content-Disposition": 'attachment; filename="timetable.png"'})
 
 
-@app.get("/")
-def serve_index():
-    index_path = get_web_dist() / "index.html"
-    if not index_path.exists():
-        return Response(status_code=404)
-    return FileResponse(index_path)
+def activity_json(event):
+    before = json.loads(event.before_json) if event.before_json else None
+    after = json.loads(event.after_json) if event.after_json else None
+    changed = [key for key in set(before or {}) | set(after or {}) if (before or {}).get(key) != (after or {}).get(key)]
+    return {"id": event.id, "actor_id": event.actor_id, "actor": event.actor, "program_id": event.program_id,
+        "action": event.action, "entity_type": event.entity_type, "entity_id": event.entity_id,
+        "before": before, "after": after, "changed_fields": sorted(changed), "reason": event.reason,
+        "created_at": auth.aware(event.created_at).isoformat()}
 
 
-@app.get("/{full_path:path}")
-def serve_spa(full_path: str):
-    if full_path.startswith("assets/"):
-        return Response(status_code=404)
-    web_dist_path = get_web_dist()
-    if not web_dist_path.exists():
-        return Response(status_code=404)
-    target = web_dist_path / full_path
-    if target.is_file():
-        return FileResponse(target)
-    index_path = web_dist_path / "index.html"
-    if not index_path.exists():
-        return Response(status_code=404)
-    return FileResponse(index_path)
+@api.get("/activity")
+def activity(after: int = 0, before: int | None = None, program_id: int | None = None, actor_id: int | None = None, q: str = "",
+             limit: int = 100, security: bool = False, db: Session = Db, user=User):
+    if security and not user.is_admin:
+        raise HTTPException(403, "Administrator access required")
+    query = select(models.Activity).where(models.Activity.security == security, models.Activity.id > after)
+    if before is not None:
+        query = query.where(models.Activity.id < before)
+    if program_id is not None:
+        query = query.where(models.Activity.program_id == program_id)
+    if actor_id is not None:
+        query = query.where(models.Activity.actor_id == actor_id)
+    if q:
+        pattern = "%" + q[:200] + "%"
+        query = query.where(or_(models.Activity.actor.ilike(pattern), models.Activity.action.ilike(pattern),
+            models.Activity.before_json.ilike(pattern), models.Activity.after_json.ilike(pattern)))
+    query = query.order_by(models.Activity.id.desc()).limit(max(1, min(limit, 200)))
+    return [activity_json(event) for event in db.scalars(query)]
+
+
+@api.get("/activity/actors")
+def activity_actors(db: Session = Db, user=User):
+    query = select(models.Activity.actor_id, models.Activity.actor).where(models.Activity.security == False).distinct()
+    return [{"id": actor_id, "username": name} for actor_id, name in db.execute(query) if actor_id is not None]
+
+
+@api.post("/presence/heartbeat")
+def heartbeat(request: Request, db: Session = Db, user=User):
+    request.state.session.last_seen = auth.now()
+    db.commit()
+    return {"ok": True}
+
+
+@api.get("/presence")
+def presence(db: Session = Db, user=User):
+    query = select(models.User).join(models.LoginSession).where(models.User.disabled == False,
+        models.LoginSession.last_seen > auth.now() - timedelta(seconds=90), models.LoginSession.expires_at > auth.now()).distinct()
+    return [{"id": item.id, "username": item.username} for item in db.scalars(query)]
+
+
+@api.get("/events")
+async def events(request: Request, after: int = 0, db: Session = Db, user=User):
+    try:
+        cursor = int(request.headers.get("Last-Event-ID", after))
+    except ValueError:
+        raise HTTPException(422, "Invalid event cursor")
+    token_hash = auth.digest(request.cookies.get(auth.COOKIE, ""))
+    user_id = user.id
+    # Release the request dependency's connection before a long-lived stream.
+    db.close()
+
+    async def stream():
+        nonlocal cursor
+        yield "retry: 2000\n\n"
+        while not await request.is_disconnected():
+            with SessionLocal() as db:
+                session = db.get(models.LoginSession, token_hash)
+                account = db.get(models.User, user_id)
+                if not session or auth.aware(session.expires_at) <= auth.now() or not account or account.disabled or account.must_change_password:
+                    yield 'event: session-expired\ndata: {}\n\n'
+                    return
+                rows = list(db.scalars(select(models.Activity).where(models.Activity.id > cursor).order_by(models.Activity.id).limit(200)))
+                for event in rows:
+                    cursor = event.id
+                    if not event.security:
+                        yield f"id: {cursor}\nevent: activity\ndata: {json.dumps(activity_json(event))}\n\n"
+                if rows:
+                    yield f"id: {cursor}\nevent: cursor\ndata: {{}}\n\n"
+                else:
+                    yield ": heartbeat\n\n"
+            await asyncio.sleep(1)
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"})
+
+
+app.include_router(api)
+web_dist = Path(__file__).resolve().parent / "web" / "dist"
+if (web_dist / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=web_dist / "assets"), name="assets")
+
+
+@app.get("/{path:path}")
+def frontend(path: str):
+    if path == "api" or path.startswith("api/"):
+        raise HTTPException(404, "API route not found")
+    index = web_dist / "index.html"
+    if not index.exists():
+        raise HTTPException(404, "Build the frontend first, or use the Vite development server")
+    return FileResponse(index)

@@ -1,0 +1,12 @@
+.git
+**/node_modules
+**/dist
+**/__pycache__
+**/*.db
+**/.pytest_cache
+.venv*
+.test-deps
+deploy/secrets
+deploy/.env
+backups
+output

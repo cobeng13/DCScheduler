@@ -1,16 +1,4 @@
-from __future__ import annotations
-
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-from app import conflicts, models, time_utils
-from app import crud
-
-
-def setup_db():
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
-    models.Base.metadata.create_all(bind=engine)
-    return sessionmaker(bind=engine)()
+from app import time_utils
 
 
 def test_overlap_logic():
@@ -19,119 +7,11 @@ def test_overlap_logic():
     assert time_utils.overlap(60, 120, 0, 59) is False
 
 
-def test_conflict_detection_room_and_faculty():
-    db = setup_db()
-    entry_a = models.ScheduleEntry(
-        program="BSCS",
-        section="A",
-        course_code="CS101",
-        course_description="Intro",
-        units=3,
-        hours=3,
-        time_lpu="7:00 AM - 8:00 AM",
-        time_24="07:00-08:00",
-        days="Monday",
-        room="R101",
-        faculty="Dr. Ada",
-        start_minutes=420,
-        end_minutes=480,
-    )
-    entry_b = models.ScheduleEntry(
-        program="BSCS",
-        section="B",
-        course_code="CS102",
-        course_description="Data",
-        units=3,
-        hours=3,
-        time_lpu="7:30 AM - 8:30 AM",
-        time_24="07:30-08:30",
-        days="Monday",
-        room="R101",
-        faculty="Dr. Ada",
-        start_minutes=450,
-        end_minutes=510,
-    )
-    db.add_all([entry_a, entry_b])
-    db.commit()
-
-    conflicts_found = conflicts.find_conflicts(db)
-    conflict_types = {(c["entry_id"], c["conflict_type"]) for c in conflicts_found}
-    assert (entry_a.id, "room") in conflict_types
-    assert (entry_a.id, "faculty") in conflict_types
-
-
-def test_conflict_detection_same_section_different_room_and_faculty():
-    db = setup_db()
-    entry_a = models.ScheduleEntry(
-        program="BSPharm",
-        section="BS Pharm 1A",
-        course_code="A",
-        course_description="Course A",
-        units=3,
-        hours=3,
-        time_lpu="7:00a-10:00a",
-        time_24="07:00-10:00",
-        days="M",
-        room="Room A",
-        faculty="Faculty A",
-        start_minutes=420,
-        end_minutes=600,
-    )
-    entry_b = models.ScheduleEntry(
-        program="BSPharm",
-        section="BS Pharm 1A",
-        course_code="B",
-        course_description="Course B",
-        units=3,
-        hours=3,
-        time_lpu="7:00a-10:00a",
-        time_24="07:00-10:00",
-        days="M",
-        room="Room B",
-        faculty="Faculty B",
-        start_minutes=420,
-        end_minutes=600,
-    )
-    db.add_all([entry_a, entry_b])
-    db.commit()
-
-    conflicts_found = conflicts.find_conflicts(db)
-    conflict_types = {(c["entry_id"], c["conflict_type"]) for c in conflicts_found}
-    assert (entry_a.id, "section") in conflict_types
-    assert (entry_b.id, "section") in conflict_types
-
-
-def test_remove_unused_placeholder_entities_when_real_data_exists():
-    db = setup_db()
-    db.add_all(
-        [
-            models.Section(name="No section yet"),
-            models.Section(name="BSN-1A"),
-            models.Faculty(name="No faculty yet"),
-            models.Faculty(name="Dr. Reyes"),
-            models.Room(name="No rooms yet"),
-            models.Room(name="R101"),
-            models.ScheduleEntry(
-                program="BSN",
-                section="BSN-1A",
-                course_code="NUR101",
-                course_description="Foundations",
-                units=3,
-                hours=3,
-                time_lpu="7:00 AM - 8:00 AM",
-                time_24="07:00-08:00",
-                days="Monday",
-                room="R101",
-                faculty="Dr. Reyes",
-                start_minutes=420,
-                end_minutes=480,
-            ),
-        ]
-    )
-    db.commit()
-
-    crud.remove_unused_placeholder_entities(db)
-
-    assert [section.name for section in db.query(models.Section).all()] == ["BSN-1A"]
-    assert [member.name for member in db.query(models.Faculty).all()] == ["Dr. Reyes"]
-    assert [room.name for room in db.query(models.Room).all()] == ["R101"]
+def test_multiday_overlap_is_rejected_and_tba_resources_do_not_conflict(clients, entry_payload):
+    alpha, beta = clients["alpha"], clients["beta"]
+    assert alpha.post("/api/schedule", json={**entry_payload, "Days": "M,W"}).status_code == 200
+    conflict = beta.post("/api/schedule", json={**entry_payload, "Program": "P2", "Days": "W,F"})
+    assert conflict.status_code == 409
+    assert {c["conflict_type"] for c in conflict.json()["detail"]["conflicts"]} == {"room", "faculty"}
+    assert beta.post("/api/schedule", json={**entry_payload, "Program": "P2", "Days": "T", "Room": "TBA", "Faculty": "TBA"}).status_code == 200
+    assert alpha.post("/api/schedule", json={**entry_payload, "Days": "T", "Room": "TBA", "Faculty": "TBA"}).status_code == 200

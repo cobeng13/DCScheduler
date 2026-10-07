@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 CANONICAL_HEADERS = [
@@ -25,16 +25,15 @@ class ScheduleEntryBase(BaseModel):
     section: str = Field(..., alias="Section")
     course_code: str = Field(..., alias="Course Code")
     course_description: str = Field(..., alias="Course Description")
-    units: float = Field(..., alias="Units")
-    hours: float = Field(..., alias="# of Hours")
+    units: float = Field(..., alias="Units", ge=0, allow_inf_nan=False)
+    hours: float = Field(..., alias="# of Hours", ge=0, allow_inf_nan=False)
     time_lpu: str = Field(..., alias="Time (LPU Std)")
     time_24: Optional[str] = Field("", alias="Time (24 Hrs)")
     days: str = Field(..., alias="Days")
     room: str = Field(..., alias="Room")
     faculty: str = Field(..., alias="Faculty")
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class ScheduleEntryCreate(ScheduleEntryBase):
@@ -42,23 +41,25 @@ class ScheduleEntryCreate(ScheduleEntryBase):
 
 
 class ScheduleEntryUpdate(ScheduleEntryBase):
-    pass
+    version: int = Field(..., ge=1)
 
 
 class ScheduleEntry(ScheduleEntryBase):
     id: int
+    program_id: int
+    section_id: int
+    room_id: Optional[int] = None
+    faculty_id: Optional[int] = None
+    version: int
 
-    class Config:
-        from_attributes = True
-        populate_by_name = True
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 
 class NamedEntity(BaseModel):
     id: int
     name: str
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class NamedEntityCreate(BaseModel):

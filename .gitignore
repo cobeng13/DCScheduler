@@ -46,3 +46,9 @@ $RECYCLE.BIN/
 # Logs
 *.log
 output/
+.test-deps*/
+.test-deps*-report.json
+.venv-*/
+deploy/.env
+deploy/secrets/
+backups/

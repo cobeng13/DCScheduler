@@ -1,0 +1,26 @@
+body { margin: 0; }
+.online-header { display:flex; align-items:center; flex-wrap:wrap; gap:12px; padding:12px 18px; background:#163047; color:white; }
+.online-header label { display:flex; align-items:center; gap:8px; }
+.online-header button,.online-header select { padding:7px; border-radius:5px; }
+.online-layout { display:grid; grid-template-columns:minmax(0,1fr) 310px; align-items:start; }
+.scheduler-workspace { min-width:0; }
+.scheduler-workspace>.app { height:calc(100vh - 62px); min-height:650px; }
+.activity-panel { padding:16px; background:#f4f7fa; border-left:1px solid #d3dde5; height:calc(100vh - 90px); overflow:auto; position:sticky; top:0; }
+.activity-panel h2 { margin-top:0; font-size:18px; }
+.activity-panel>input,.activity-panel>select { width:100%; box-sizing:border-box; margin:4px 0; padding:7px; }
+.activity-event { font-size:12px; padding:12px 0; border-bottom:1px solid #d3dde5; overflow-wrap:anywhere; }
+.activity-event summary { cursor:pointer; margin-top:6px; }
+.activity-event details div { margin:5px 0; }
+.presence { font-size:12px; }
+.connected { color:#a8edbb; }.reconnecting { color:#ffda87; }
+.online-error { padding:12px; background:#ffe6e2; color:#772318; display:flex; justify-content:space-between; }
+.account-card { max-width:430px; margin:8vh auto; padding:28px; background:white; border:1px solid #d3dde5; border-radius:12px; font-family:system-ui,sans-serif; }
+.account-card label { display:block; margin:14px 0; }.account-card input { display:block; box-sizing:border-box; width:100%; padding:10px; margin-top:6px; }
+.account-card button { padding:10px 18px; }.account-card [role=alert] { color:#a12820; }
+.admin-panel { background:#eef4f8; padding:18px; border-bottom:1px solid #c4d3df; }
+.admin-panel form,.admin-user { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px; }
+.admin-panel h3 { width:100%; margin:10px 0; }.admin-panel>label { display:inline-flex; gap:8px; padding:8px; }
+.admin-panel input,.admin-panel select { padding:8px; }.admin-user span { min-width:200px; }
+.readonly-banner { padding:8px 16px; background:#fff2d5; font-size:13px; }
+.online-readonly .panel input,.online-readonly .panel button { opacity:.6; }
+@media(max-width:1100px) { .online-layout { grid-template-columns:1fr; }.activity-panel { position:static; height:350px; border-left:0; border-top:1px solid #d3dde5; } }
