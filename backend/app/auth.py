@@ -71,11 +71,9 @@ def current_user(request: Request, db: Session = Depends(get_db)):
     if not user or user.disabled:
         raise HTTPException(401, "Account unavailable")
     if request.method not in SAFE_METHODS:
-        if not hmac.compare_digest(request.headers.get("X-CSRF-Token", ""), session.csrf_token):
+        if not hmac.compare_digest(request.headers.get("X-CSRF-Token", "").encode(), session.csrf_token.encode()):
             raise HTTPException(403, "Invalid CSRF token")
-        expected = os.environ.get("PUBLIC_ORIGIN")
-        if expected and request.headers.get("origin") not in {None, expected}:
-            raise HTTPException(403, "Invalid origin")
+        validate_origin(request)
     if user.must_change_password and request.url.path not in {
         "/api/auth/me", "/api/auth/password", "/api/auth/logout"
     }:
@@ -88,6 +86,12 @@ def admin(user=Depends(current_user)):
     if not user.is_admin:
         raise HTTPException(403, "Administrator access required")
     return user
+
+
+def validate_origin(request):
+    expected = os.environ.get("PUBLIC_ORIGIN")
+    if expected and request.headers.get("origin") not in {None, expected}:
+        raise HTTPException(403, "Invalid origin")
 
 
 def user_json(user):
@@ -124,3 +128,16 @@ def audit(db, user, action, kind, entity_id=None, program_id=None, before=None, 
         reason=reason, security=security)
     db.add(event)
     return event
+
+
+def cleanup_rows(db):
+    """Called in login transactions and every 15 minutes by the app lifespan."""
+    db.execute(delete(models.LoginAttempt).where(models.LoginAttempt.window_start < now() - timedelta(hours=24)))
+    db.execute(delete(models.LoginSession).where(models.LoginSession.expires_at <= now()))
+
+
+def cleanup_expired():
+    with SessionLocal() as db:
+        lock(db)
+        cleanup_rows(db)
+        db.commit()

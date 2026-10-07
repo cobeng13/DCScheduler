@@ -6,6 +6,9 @@ COPY frontend/ ./
 RUN npm run build
 
 FROM python:3.12-slim-bookworm
+ARG APP_REVISION=unknown
+LABEL org.opencontainers.image.revision=$APP_REVISION
+ENV APP_REVISION=$APP_REVISION
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY backend/requirements.txt ./

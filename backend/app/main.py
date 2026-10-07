@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
+import logging
 import csv
 from datetime import timedelta
 import io
@@ -9,7 +11,7 @@ import os
 from pathlib import Path
 import secrets
 
-from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
@@ -19,8 +21,30 @@ from sqlalchemy.orm import Session
 
 from . import auth, models, online_service as service, reports, schemas
 from .db import SessionLocal
+from .limits import BodyLimitMiddleware, bounded_json, PREFERENCES_BYTES
 
-app = FastAPI(title="CAMP Online Scheduler")
+@asynccontextmanager
+async def lifespan(app):
+    async def housekeeping():
+        while True:
+            try:
+                await asyncio.to_thread(auth.cleanup_expired)
+            except Exception:
+                logging.getLogger(__name__).error("Authentication housekeeping failed; check database availability")
+            await asyncio.sleep(900)
+    task = asyncio.create_task(housekeeping())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="CAMP Online Scheduler", lifespan=lifespan)
+app.add_middleware(BodyLimitMiddleware)
 api = APIRouter(prefix="/api")
 Db = Depends(auth.get_db)
 User = Depends(auth.current_user)
@@ -33,6 +57,13 @@ async def security_headers(request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "same-origin"
     response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; script-src-attr 'none'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+        "font-src 'self' data:; connect-src 'self'; object-src 'none'; "
+        "base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    )
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
     if request.url.path.startswith("/api"):
         response.headers["Cache-Control"] = "no-store, no-transform" if request.url.path == "/api/events" else "no-store"
     return response
@@ -90,7 +121,7 @@ class BatchPayload(BaseModel):
 
 
 @api.post("/schedule/batch")
-def schedule_batch(payload: BatchPayload, override_reason: str | None = None, db: Session = Db, user=User):
+def schedule_batch(payload: BatchPayload, override_reason: str | None = Query(default=None, max_length=1200), db: Session = Db, user=User):
     results = []
     for operation in payload.operations:
         kind = operation.get("method")
@@ -130,36 +161,35 @@ def health(db: Session = Db):
     db.execute(text("SELECT 1"))
     # Readiness checks the migrated schema as well as the database connection.
     db.scalar(select(models.User.id).limit(1))
-    return {"ok": True}
+    return {"ok": True, "revision": os.getenv("APP_REVISION", "unknown")}
 
 
 @api.post("/auth/login")
 def login(payload: Credentials, request: Request, response: Response, db: Session = Db):
+    auth.validate_origin(request)
     auth.lock(db)
     username = payload.username.strip().casefold()
-    # Do not trust arbitrary forwarded headers as client identities. Account and
-    # direct peer limits protect login even when the tunnel shares an origin IP.
-    keys = [auth.digest("account:" + username), auth.digest("peer:" + (request.client.host if request.client else "unknown"))]
-    attempts = []
-    for key in keys:
-        row = db.get(models.LoginAttempt, key)
-        if not row:
-            row = models.LoginAttempt(key=key, attempts=0, window_start=auth.now())
-            db.add(row)
-        elif auth.aware(row.window_start) < auth.now() - timedelta(minutes=15):
-            row.attempts, row.window_start = 0, auth.now()
-        attempts.append(row)
-    if attempts[0].attempts >= 10 or attempts[1].attempts >= 100:
+    # The direct peer is normally a shared tunnel connector, not an end user.
+    # Never use forwarded headers or that peer to lock out unrelated accounts.
+    auth.cleanup_rows(db)
+    key = auth.digest("account:" + username)
+    attempt = db.get(models.LoginAttempt, key)
+    if not attempt:
+        attempt = models.LoginAttempt(key=key, attempts=0, window_start=auth.now())
+        db.add(attempt)
+    elif auth.aware(attempt.window_start) < auth.now() - timedelta(minutes=15):
+        attempt.attempts, attempt.window_start = 0, auth.now()
+    if attempt.attempts >= 10:
+        db.commit()  # Persist cleanup even for throttled requests.
         raise HTTPException(429, "Too many sign-in attempts. Try again in 15 minutes.")
     user = db.scalar(select(models.User).where(models.User.username == username))
     valid = auth.verify_password(payload.password, user.password_hash if user else DUMMY_PASSWORD)
     if not user or user.disabled or not valid:
-        for row in attempts:
-            row.attempts += 1
+        attempt.attempts += 1
         auth.audit(db, None, "login_failed", "authentication", security=True)
         db.commit()
         raise HTTPException(401, "Invalid username or password")
-    attempts[0].attempts = 0
+    attempt.attempts = 0
     token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
     db.execute(delete(models.LoginSession).where(models.LoginSession.expires_at < auth.now()))
     session = models.LoginSession(token_hash=auth.digest(token), user_id=user.id, csrf_token=csrf,
@@ -209,7 +239,10 @@ def users(db: Session = Db, user=Admin):
 
 @api.post("/admin/users")
 def create_user(payload: UserCreate, db: Session = Db, user=Admin):
-    item = models.User(username=service.label(payload.username).casefold(), password_hash=auth.password_hash(payload.password),
+    username = service.label(payload.username).casefold()
+    if len(username) > 100:
+        raise HTTPException(422, "Normalized username exceeds 100 characters")
+    item = models.User(username=username, password_hash=auth.password_hash(payload.password),
         is_admin=payload.is_admin, disabled=False, must_change_password=True)
     db.add(item)
     db.flush()
@@ -292,14 +325,14 @@ def get_schedule(entry_id: int, db: Session = Db, user=User):
 
 
 @api.post("/schedule", response_model=schemas.ScheduleEntry)
-def create_schedule(payload: schemas.ScheduleEntryCreate, override_reason: str | None = None, db: Session = Db, user=User):
+def create_schedule(payload: schemas.ScheduleEntryCreate, override_reason: str | None = Query(default=None, max_length=1200), db: Session = Db, user=User):
     item = service.save(db, user, payload, override_reason=override_reason)
     db.commit()
     return item
 
 
 @api.put("/schedule/{entry_id}", response_model=schemas.ScheduleEntry)
-def update_schedule(entry_id: int, payload: schemas.ScheduleEntryUpdate, override_reason: str | None = None, db: Session = Db, user=User):
+def update_schedule(entry_id: int, payload: schemas.ScheduleEntryUpdate, override_reason: str | None = Query(default=None, max_length=1200), db: Session = Db, user=User):
     item = service.save(db, user, payload, entry_id, override_reason)
     db.commit()
     return item
@@ -350,6 +383,8 @@ def create_entity(kind: str, payload: EntityPayload, db: Session = Db, user=User
     cls = entity_class(kind)
     if cls is models.Section:
         auth.editable(db, user, require_program(db, payload.program_id).id)
+    if cls is not models.Section and not user.is_admin:
+        raise HTTPException(403, "Only administrators can create shared resources")
     name = service.label(payload.name)
     if cls is not models.Section and service.normalized(name) == "tba":
         raise HTTPException(422, "TBA is an unassigned resource")
@@ -472,6 +507,7 @@ def get_settings(program_id: int | None = None, db: Session = Db, user=User):
 
 @api.put("/settings")
 def put_settings(payload: dict, program_id: int | None = None, db: Session = Db, user=User):
+    bounded_json(payload)
     settings = payload.get("settings", {})
     if not isinstance(settings, dict):
         raise HTTPException(422, "Invalid settings")
@@ -481,8 +517,23 @@ def put_settings(payload: dict, program_id: int | None = None, db: Session = Db,
         state = settings["curriculumState"]
         if not isinstance(state, dict):
             raise HTTPException(422, "Invalid curriculum")
-        for curriculum in state.get("curricula", []):
+        curricula = state.get("curricula", [])
+        if not isinstance(curricula, list) or len(curricula) > 100:
+            raise HTTPException(422, "Curriculum limit is 100 curricula")
+        total_courses = 0
+        for curriculum in curricula:
+            if not isinstance(curriculum, dict) or not isinstance(curriculum.get("courses", []), list):
+                raise HTTPException(422, "Invalid curriculum courses")
+            total_courses += len(curriculum.get("courses", []))
+            if total_courses > 2000:
+                raise HTTPException(422, "Curriculum limit is 2000 courses")
             for course in curriculum.get("courses", []):
+                if not isinstance(course, dict):
+                    raise HTTPException(422, "Invalid curriculum course")
+                for key, maximum in {"program": 200, "courseCode": 100, "courseDescription": 2000,
+                                     "yearLevel": 100, "semester": 100}.items():
+                    if key in course and (not isinstance(course[key], str) or len(course[key]) > maximum):
+                        raise HTTPException(422, f"Invalid curriculum course {key}; maximum {maximum} characters")
                 if course.get("program") != program.name:
                     raise HTTPException(403, "Curriculum contains a different program")
         old = json.loads(program.settings_json)
@@ -490,7 +541,9 @@ def put_settings(payload: dict, program_id: int | None = None, db: Session = Db,
         program.version += 1
         auth.audit(db, user, "updated", "curriculum", program.id, program.id, old, {"curriculumState": state})
     if "customize" in settings:
-        user.preferences_json = json.dumps({"customize": settings["customize"]})
+        if not isinstance(settings["customize"], dict):
+            raise HTTPException(422, "Invalid personal preferences")
+        user.preferences_json = bounded_json({"customize": settings["customize"]}, PREFERENCES_BYTES)
     # Conflict-ignore switches are presentation-only in the online UI and cannot
     # disable mandatory server booking checks. Global rules have their own API.
     db.commit()
@@ -600,7 +653,10 @@ def faculty_export(faculty: str, db: Session = Db, user=User):
 def png_export(payload: dict, user=User):
     import base64
     import binascii
-    encoded = str(payload.get("png_base64", "")).split(",")[-1]
+    encoded = payload.get("png_base64", "")
+    if not isinstance(encoded, str):
+        raise HTTPException(422, "Invalid PNG")
+    encoded = encoded.split(",", 1)[-1]
     if len(encoded) > 14 * 1024 * 1024:
         raise HTTPException(413, "PNG too large")
     try:

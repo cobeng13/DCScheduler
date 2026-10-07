@@ -20,6 +20,8 @@ if ! git symbolic-ref --quiet HEAD >/dev/null; then
   exit 1
 fi
 
+bash "$DEPLOY_DIR/preflight.sh"
+
 echo "Pulling $DEPLOY_BRANCH from $REPOSITORY_URL..."
 # Use the online repository explicitly, including in checkouts whose origin
 # still points at the original local scheduler repository.

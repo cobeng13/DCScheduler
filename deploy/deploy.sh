@@ -2,14 +2,10 @@
 set -euo pipefail
 source "$(dirname -- "$0")/common.sh"
 cd "$PROJECT_DIR"
-command -v docker >/dev/null
-command -v ss >/dev/null
-command -v curl >/dev/null
-if ! docker container inspect camp-scheduler >/dev/null 2>&1; then
-  if ss -H -ltn "sport = :$APP_PORT" | grep -q .; then
-    echo "Port $APP_PORT is already in use. Choose another APP_PORT." >&2; exit 1
-  fi
-fi
+bash "$DEPLOY_DIR/preflight.sh"
+# Refuse uncommitted source so the image label identifies reproducible code.
+[[ -z "$(git status --porcelain)" ]] || { echo "Commit or move local changes before deployment." >&2; exit 1; }
+revision="$(git rev-parse HEAD)"
 mkdir -p "$SECRET_DIR"
 chmod 700 "$SECRET_DIR"
 if [[ ! -f "$SECRET_DIR/db_password" ]]; then
@@ -35,7 +31,7 @@ for attempt in $(seq 1 60); do
   sleep 1
 done
 [[ "$ready" == true ]] || { echo "Database did not become ready" >&2; exit 1; }
-docker build -t "$APP_IMAGE" .
+docker build --build-arg "APP_REVISION=$revision" -t "$APP_IMAGE" .
 if docker container inspect camp-scheduler >/dev/null 2>&1; then
   bash "$DEPLOY_DIR/backup.sh"
   # Retain the previous immutable image ID for an application rollback.
@@ -46,13 +42,7 @@ docker run --rm --network camp-scheduler "${APP_ENV[@]}" "${APP_MOUNTS[@]}" "$AP
 docker container inspect camp-scheduler >/dev/null 2>&1 && docker rm camp-scheduler >/dev/null
 docker run -d --name camp-scheduler --network camp-scheduler --restart unless-stopped \
   "${LOG_OPTIONS[@]}" "${APP_ENV[@]}" "${APP_MOUNTS[@]}" --read-only --tmpfs /tmp:rw,noexec,nosuid,size=32m \
-  --cap-drop ALL --security-opt no-new-privileges:true --publish "$BIND_ADDRESS:$APP_PORT:8000" "$APP_IMAGE"
-for attempt in $(seq 1 30); do
-  if curl --fail --silent "http://$BIND_ADDRESS:$APP_PORT/api/health" >/dev/null; then
-    echo "Scheduler ready on $BIND_ADDRESS:$APP_PORT. Route the Cloudflare hostname to this address."
-    exit 0
-  fi
-  sleep 1
-done
-echo "App readiness failed. Inspect docker logs camp-scheduler; see DEPLOYMENT.md for rollback." >&2
-exit 1
+  --cap-drop ALL --security-opt no-new-privileges:true --publish "$PUBLISH_ADDRESS:$APP_PORT:8000" "$APP_IMAGE"
+check_readiness
+printf '%s\n' "$revision" > "$SECRET_DIR/deployed-revision"
+echo "Deployed revision $revision"

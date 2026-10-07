@@ -5,7 +5,7 @@
 **/*.db
 **/.pytest_cache
 .venv*
-.test-deps
+.test-deps*
 deploy/secrets
 deploy/.env
 backups

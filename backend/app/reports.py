@@ -33,7 +33,13 @@ def build_text_rows(entries: Iterable[dict]) -> list[list[str]]:
 def write_csv(rows: list[list[str]]) -> bytes:
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerows(rows)
+    # Quoting CSV syntax alone does not stop spreadsheet formula execution.
+    def safe_cell(value):
+        text = "" if value is None else str(value)
+        if text.lstrip().startswith(("=", "+", "-", "@")) or text.startswith(("\t", "\r", "\n")):
+            return "'" + text
+        return text
+    writer.writerows([safe_cell(cell) for cell in row] for row in rows)
     return buffer.getvalue().encode("utf-8")
 
 

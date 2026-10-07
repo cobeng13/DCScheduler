@@ -59,11 +59,18 @@ def pg_clients():
         root.dispose()
 
 
-def test_simultaneous_bookings_only_one_commits(pg_clients, entry_payload):
+@pytest.mark.parametrize("resource", ["room", "faculty", "section"])
+def test_simultaneous_bookings_only_one_commits(pg_clients, entry_payload, resource):
     barrier = Barrier(2)
     def book(index):
         barrier.wait(timeout=10)
-        return pg_clients[index].post("/api/schedule", json={**entry_payload, "Program": f"P{index}", "Room": "R", "Faculty": "F"})
+        payload = {**entry_payload, "Program": f"P{index}", "Room": "TBA", "Faculty": "TBA"}
+        if resource == "section":
+            payload["Program"] = "P0"
+        else:
+            payload[resource.title()] = "R" if resource == "room" else "F"
+        client = pg_clients[0] if resource == "section" else pg_clients[index]
+        return client.post("/api/schedule", json=payload)
     with ThreadPoolExecutor(max_workers=2) as pool:
         responses = list(pool.map(book, (0, 1)))
     assert sorted(r.status_code for r in responses) == [200, 409]

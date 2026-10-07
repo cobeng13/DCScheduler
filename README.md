@@ -4,6 +4,10 @@ Academic scheduling web app with a FastAPI backend, React frontend, PostgreSQL, 
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for CAMP Server Docker deployment, Cloudflare Tunnel configuration, account bootstrap, backups, restoration, and local development. Online deployment starts with an empty database. Do not upgrade a populated local timetable database.
 
+Production hardening includes bounded request/settings sizes, shared schema validation for schedule edits and CSV imports, spreadsheet-safe CSV exports, account-based login throttling suitable for a shared tunnel connector, periodic authentication cleanup, and CSP/Permissions-Policy headers. Faculty and Room records are shared: only administrators may create, rename, merge, or delete them. Schedulers can use existing shared resources and create sections within their assigned programs; their CSV imports cannot create new shared resources.
+
+Run `bash deploy/update.sh` on the configured Linux server for a Git pull, image rebuild, backup, migration, and relaunch. Preflight checks run before changes to running services, and deploy/rollback/restore require a successful readiness check. The image label `org.opencontainers.image.revision` and `/api/health` identify the running Git revision. See [HARDENING.md](HARDENING.md) for review findings and validation results.
+
 ## Repository Structure
 
 - `backend/` - FastAPI + SQLAlchemy + Alembic + PostgreSQL + pytest (SQLite for local tests)

@@ -5,12 +5,15 @@ from . import auth, models, schemas, time_utils
 
 
 def normalized(name):
-    return " ".join(name.strip().casefold().split())
+    result = " ".join(name.strip().casefold().split())
+    if len(result) > 200 or "\x00" in result:
+        raise HTTPException(422, "Normalized names must not exceed 200 characters or contain null characters")
+    return result
 
 
 def label(name):
     result = " ".join(name.strip().split())
-    if not result or len(result) > 200:
+    if not result or len(result) > 200 or "\x00" in result:
         raise HTTPException(422, "Names must contain 1–200 characters")
     return result
 
@@ -101,8 +104,8 @@ def build_candidate(db, user, payload, allow_catalog_add=False):
         raise HTTPException(422, "Select an existing program")
     auth.editable(db, user, program.id)
     section = resolve(db, models.Section, data["section"], program.id, allow_catalog_add)
-    room = resolve(db, models.Room, data["room"], create=allow_catalog_add)
-    faculty = resolve(db, models.Faculty, data["faculty"], create=allow_catalog_add)
+    room = resolve(db, models.Room, data["room"], create=allow_catalog_add and user.is_admin)
+    faculty = resolve(db, models.Faculty, data["faculty"], create=allow_catalog_add and user.is_admin)
     if time_utils.is_tba(data["time_lpu"]) or time_utils.is_tba(data["days"]):
         data.update(time_lpu="TBA", time_24=None, days="TBA", start_minutes=None, end_minutes=None)
     else:
@@ -124,6 +127,8 @@ def build_candidate(db, user, payload, allow_catalog_add=False):
 
 
 def validate_conflicts(db, user, candidate, entry_id=0, override_reason=None):
+    if override_reason is not None and (len(override_reason) > 1200 or "\x00" in override_reason):
+        raise HTTPException(422, "Override reason exceeds 1200 characters")
     found = candidate_conflicts(db, candidate, entry_id)
     if override_reason and (not user.is_admin or not override_reason.strip()):
         raise HTTPException(403, "Only administrators may override with a reason")

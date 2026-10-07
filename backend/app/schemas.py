@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 CANONICAL_HEADERS = [
@@ -21,19 +21,26 @@ CANONICAL_HEADERS = [
 
 
 class ScheduleEntryBase(BaseModel):
-    program: str = Field(..., alias="Program")
-    section: str = Field(..., alias="Section")
-    course_code: str = Field(..., alias="Course Code")
-    course_description: str = Field(..., alias="Course Description")
+    program: str = Field(..., alias="Program", max_length=200)
+    section: str = Field(..., alias="Section", max_length=200)
+    course_code: str = Field(..., alias="Course Code", max_length=100)
+    course_description: str = Field(..., alias="Course Description", max_length=2000)
     units: float = Field(..., alias="Units", ge=0, allow_inf_nan=False)
     hours: float = Field(..., alias="# of Hours", ge=0, allow_inf_nan=False)
-    time_lpu: str = Field(..., alias="Time (LPU Std)")
-    time_24: Optional[str] = Field("", alias="Time (24 Hrs)")
-    days: str = Field(..., alias="Days")
-    room: str = Field(..., alias="Room")
-    faculty: str = Field(..., alias="Faculty")
+    time_lpu: str = Field(..., alias="Time (LPU Std)", max_length=100)
+    time_24: Optional[str] = Field("", alias="Time (24 Hrs)", max_length=100)
+    days: str = Field(..., alias="Days", max_length=64)
+    room: str = Field(..., alias="Room", max_length=200)
+    faculty: str = Field(..., alias="Faculty", max_length=200)
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("*", mode="after")
+    @classmethod
+    def valid_text(cls, value):
+        if isinstance(value, str) and "\x00" in value:
+            raise ValueError("Text cannot contain null characters")
+        return value
 
 
 class ScheduleEntryCreate(ScheduleEntryBase):
@@ -45,6 +52,17 @@ class ScheduleEntryUpdate(ScheduleEntryBase):
 
 
 class ScheduleEntry(ScheduleEntryBase):
+    # Existing rows remain readable even if they predate the write limits.
+    # Editing them requires bringing the fields within the current limits.
+    program: str = Field(alias="Program")
+    section: str = Field(alias="Section")
+    course_code: str = Field(alias="Course Code")
+    course_description: str = Field(alias="Course Description")
+    time_lpu: str = Field(alias="Time (LPU Std)")
+    time_24: Optional[str] = Field(default="", alias="Time (24 Hrs)")
+    days: str = Field(alias="Days")
+    room: str = Field(alias="Room")
+    faculty: str = Field(alias="Faculty")
     id: int
     program_id: int
     section_id: int
@@ -63,7 +81,7 @@ class NamedEntity(BaseModel):
 
 
 class NamedEntityCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
 
 
 class ConflictSummary(BaseModel):

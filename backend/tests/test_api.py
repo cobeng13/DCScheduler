@@ -80,9 +80,9 @@ def test_faculty_conflict_tba_and_adjacent_times(clients, entry_payload):
 
 def test_catalog_ownership_normalization_and_force_delete(clients, entry_payload):
     alpha, beta, admin = clients["alpha"], clients["beta"], clients["admin"]
-    room = alpha.post("/api/rooms", json={"name": "  Lab   2 "}).json()
+    room = admin.post("/api/rooms", json={"name": "  Lab   2 "}).json()
     assert room["name"] == "Lab 2"
-    assert beta.post("/api/rooms", json={"name": "LAB 2"}).status_code == 409
+    assert admin.post("/api/rooms", json={"name": "LAB 2"}).status_code == 409
     assert alpha.put(f'/api/rooms/{room["id"]}', json={"name": "Other", "version": 1}).status_code == 403
     assert beta.post("/api/sections", json={"name": "B", "program_id": 1}).status_code == 403
     assert beta.put("/api/sections/1", json={"name": "B", "version": 1}).status_code == 403
@@ -136,7 +136,7 @@ def csv_file(rows):
     writer = csv.DictWriter(buffer, schemas.CANONICAL_HEADERS)
     writer.writeheader()
     for row in rows:
-        writer.writerow({**row, "Time (24 Hrs)": ""})
+        writer.writerow({**row, "Time (24 Hrs)": row.get("Time (24 Hrs)", "")})
     return {"file": ("schedule.csv", buffer.getvalue().encode(), "text/csv")}
 
 

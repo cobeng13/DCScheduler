@@ -1,11 +1,13 @@
 import asyncio
+import pytest
 from starlette.requests import Request
 from app import models
 from app.db import SessionLocal
 from app.main import events
 
 
-def test_stream_replays_committed_changes_and_revokes_live_sessions(clients, entry_payload):
+@pytest.mark.parametrize("invalidation", ["disable", "reset", "logout"])
+def test_stream_replays_committed_changes_and_revokes_live_sessions(clients, entry_payload, invalidation):
     alpha = clients["alpha"]
     token = alpha.cookies.get("scheduler_session")
     created = alpha.post("/api/schedule", json=entry_payload)
@@ -31,7 +33,11 @@ def test_stream_replays_committed_changes_and_revokes_live_sessions(clients, ent
         assert "Course Description" in replay
         assert "event: cursor" in await anext(stream)
         # Revoking the database session terminates an already-open stream.
-        result = clients["admin"].put("/api/admin/users/2", json={"disabled": True})
+        if invalidation == "logout":
+            result = alpha.post("/api/auth/logout")
+        else:
+            payload = {"disabled": True} if invalidation == "disable" else {"password": "Reset-password-123!"}
+            result = clients["admin"].put("/api/admin/users/2", json=payload)
         assert result.status_code == 200
         assert "session-expired" in await anext(stream)
         await stream.aclose()
