@@ -3,6 +3,8 @@ set -euo pipefail
 
 DEPLOY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname -- "$DEPLOY_DIR")"
+REPOSITORY_URL="https://github.com/cobeng13/DCScheduler.git"
+DEPLOY_BRANCH="main"
 cd "$PROJECT_DIR"
 
 command -v git >/dev/null
@@ -14,16 +16,14 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 if ! git symbolic-ref --quiet HEAD >/dev/null; then
-  echo "Check out a branch with a configured upstream before updating." >&2
-  exit 1
-fi
-if ! git rev-parse --verify '@{upstream}' >/dev/null 2>&1; then
-  echo "Configure this branch's Git upstream before updating." >&2
+  echo "Check out a branch before updating." >&2
   exit 1
 fi
 
-echo "Pulling the latest revision from this branch's upstream..."
-git pull --ff-only
+echo "Pulling $DEPLOY_BRANCH from $REPOSITORY_URL..."
+# Use the online repository explicitly, including in checkouts whose origin
+# still points at the original local scheduler repository.
+git pull --ff-only "$REPOSITORY_URL" "$DEPLOY_BRANCH"
 echo "Building and deploying the scheduler..."
 # Execute the freshly pulled deployment script. It builds before downtime,
 # backs up the database, migrates explicitly, and checks the relaunched app.

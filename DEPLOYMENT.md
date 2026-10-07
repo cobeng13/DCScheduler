@@ -4,7 +4,7 @@ The scheduler is a separate two-container stack on `apps-server`. It starts empt
 
 ## Initial setup
 
-1. Clone this repository to `/opt/apps/TheScheduler-Online`.
+1. Clone `https://github.com/cobeng13/DCScheduler.git` to `/opt/apps/TheScheduler-Online`.
 2. Copy `deploy/.env.example` to `deploy/.env`; set the real HTTPS `PUBLIC_ORIGIN`, available `APP_PORT` (default 8004), and `BACKUP_DIR` on your backup storage. Keep this file private and outside Git. `BIND_ADDRESS=127.0.0.1` is appropriate for a tunnel connector on this host. If the connector runs on a different Proxmox guest, use the apps-server LAN IP and restrict access to the connector with the server firewall.
 3. Run `bash deploy/deploy.sh`. This builds the UI, creates a private Docker network and persistent PostgreSQL volume, runs Alembic migrations, and starts the app. PostgreSQL has no published port. The application uses UID 10001 and a read-only filesystem.
 4. Run `docker exec -it camp-scheduler python -m app.bootstrap YOUR_USERNAME`. Enter the password interactively; it never appears in shell history. Sign in and change it.
@@ -31,7 +31,7 @@ cd /opt/apps/TheScheduler-Online
 bash deploy/update.sh
 ```
 
-The script requires a clean checkout and a branch with a configured upstream. It runs `git pull --ff-only`, then executes the freshly pulled deployment script to rebuild the image and relaunch the app. Git authentication must already work for that account. Local `deploy/.env`, secrets, and backups remain outside Git. A failed pull or image build stops the update before application downtime.
+The script requires a clean checkout on a branch. It pulls `main` directly from `https://github.com/cobeng13/DCScheduler.git` using `git pull --ff-only`, even if the checkout's origin still points at the original local scheduler repository. It then executes the freshly pulled deployment script to rebuild the image and relaunch the app. Git authentication must already work for that account. Local `deploy/.env`, secrets, and backups remain outside Git. A failed pull or image build stops the update before application downtime.
 
 Deployment builds before downtime, takes a backup, records the previous app image, stops the app, migrates, and replaces only the scheduler container. To deploy an already checked-out reviewed revision without pulling, run `bash deploy/deploy.sh`. App and database logs are bounded to three 10 MB files each. Health checks report readiness; Docker restart policies recover exited containers, but an unhealthy running container needs operator attention.
 
