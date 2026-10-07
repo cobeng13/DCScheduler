@@ -83,3 +83,9 @@ Live delivery targets two seconds under normal operation. Test it through your a
 Install `backend/requirements.txt`, then from `backend` run `alembic upgrade head` against a NEW database. Set `COOKIE_SECURE=false` for local HTTP development only, bootstrap an admin, and run `uvicorn app.main:app --port 8000`. Run `npm ci` and `npm run dev` in `frontend`; Vite proxies `/api` to the backend. Never point the new migration at a populated local timetable.
 
 Backend tests: `python -m pytest backend/tests`. Optional PostgreSQL integration tests use a dedicated disposable database configured with `TEST_POSTGRES_URL`; never use a production URL. Frontend verification: `npm test` and `npm run build` in `frontend` with Node 22.18+.
+
+## Shared conflict rules
+
+The **Rules** menu restores Ignore room conflicts and Ignore faculty conflicts. All signed-in users can view these shared switches, but only admins can change them. Both default to off (checks enforced). Turning a switch on permits that resource overlap for all users/programs, including CSV imports and bulk saves. Section overlaps always remain blocked; TBA resources remain unassigned. Turning a switch off reports existing overlaps again without removing bookings. Admin overrides with reasons remain available for checks still enabled.
+
+Changes use the normal CSRF/origin protection, transaction advisory lock, stale-version detection and shared audit/SSE history. `GET /api/rules` is authenticated; `PUT /api/admin/rules` is admin-only and requires the current version plus boolean `ignoreRoom` and `ignoreFaculty`. Old `/api/settings` conflictIgnore values cannot change these rules. Existing AppSettings JSON stores the flags and rules version; no migration or environment variable is required. Other browser sessions refresh the rules and conflict display via SSE without replacing open forms. Per-resource ignore lists are not enabled by this change.

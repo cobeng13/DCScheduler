@@ -1,4 +1,5 @@
 """Transactional scheduler operations. Callers own the commit."""
+import json
 from fastapi import HTTPException
 from sqlalchemy import or_, select
 from . import auth, models, schemas, time_utils
@@ -48,9 +49,22 @@ def resolve(db, cls, name, program_id=None, create=False):
     return item
 
 
+def scheduling_rules(db):
+    item = db.get(models.AppSettings, 1)
+    stored = json.loads(item.settings_json) if item else {}
+    return {"ignoreRoom": stored.get("ignoreRoom") is True,
+            "ignoreFaculty": stored.get("ignoreFaculty") is True}, stored.get("rulesVersion", 1)
+
+
+def enforced_kinds(db):
+    rules, _ = scheduling_rules(db)
+    return ["section"] + ([] if rules["ignoreRoom"] else ["room"]) + ([] if rules["ignoreFaculty"] else ["faculty"])
+
+
 def candidate_conflicts(db, candidate, entry_id=0):
     if candidate.start_minutes is None:
         return []
+    kinds = enforced_kinds(db)
     days = time_utils.normalize_days(candidate.days)
     result = []
     matches = [models.ScheduleEntry.section_id == candidate.section_id]
@@ -66,7 +80,7 @@ def candidate_conflicts(db, candidate, entry_id=0):
             continue
         if not time_utils.overlap(candidate.start_minutes, candidate.end_minutes, other.start_minutes, other.end_minutes):
             continue
-        for kind in ("section", "room", "faculty"):
+        for kind in kinds:
             key = f"{kind}_id"
             if getattr(candidate, key) is not None and getattr(candidate, key) == getattr(other, key):
                 result.append({"conflict_type": kind, "entry": serialize(other)})
@@ -75,13 +89,14 @@ def candidate_conflicts(db, candidate, entry_id=0):
 
 def all_conflicts(db):
     """One database read; compare only bookings sharing a day and resource."""
+    kinds = enforced_kinds(db)
     buckets = {}
     groups = {}
     for entry in db.scalars(select(models.ScheduleEntry)):
         if entry.start_minutes is None:
             continue
         for day in time_utils.normalize_days(entry.days):
-            for kind in ("section", "room", "faculty"):
+            for kind in kinds:
                 resource_id = getattr(entry, kind + "_id")
                 if resource_id is not None:
                     buckets.setdefault((day, kind, resource_id), []).append(entry)

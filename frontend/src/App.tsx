@@ -2,7 +2,7 @@ import { parseCurriculumCsv, normalizeSemester, curriculumTerms, curriculumIdFor
 import type { Curriculum, CurriculumCourse, CurriculumState, CurriculumTerm } from "./curriculum";
 import html2canvas from "html2canvas";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { schedulerFetch as fetch, pinVersion, programName, snapshotVersions, withExpectedVersions, scopedStorage as localStorage } from "./online";
+import { request as onlineRequest, schedulerFetch as fetch, pinVersion, programName, snapshotVersions, withExpectedVersions, scopedStorage as localStorage } from "./online";
 
 type ScheduleEntry = {
   id: number;
@@ -597,6 +597,10 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   const [openExportSubmenu, setOpenExportSubmenu] = useState(false);
   const [isFacultyLoadExportOpen, setIsFacultyLoadExportOpen] = useState(false);
   const [facultyLoadExportNames, setFacultyLoadExportNames] = useState<string[]>([]);
+  const rulesVersion = useRef(1);
+  const rulesBusy = useRef(false);
+  const [isRulesSaving, setIsRulesSaving] = useState(false);
+  const [rulesLoaded, setRulesLoaded] = useState(false);
   const [ignoreFaculty, setIgnoreFaculty] = useState(false);
   const [ignoreRoom, setIgnoreRoom] = useState(false);
   const [ignoreTba, setIgnoreTba] = useState(false);
@@ -815,6 +819,38 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     setSectionCurriculumIds(normalized.sectionCurriculumIds);
   };
 
+  const loadGlobalRules = async () => {
+    const data = await onlineRequest<{ rules: { ignoreRoom: boolean; ignoreFaculty: boolean }; version: number }>("/rules");
+    if (rulesBusy.current || data.version < rulesVersion.current) return;
+    rulesVersion.current = data.version;
+    const next = normalizeConflictIgnoreSettings(data.rules);
+    applyConflictIgnoreSettings(next);
+    setRulesLoaded(true);
+    return next;
+  };
+
+  const changeGlobalRule = async (field: "ignoreRoom" | "ignoreFaculty", value: boolean) => {
+    if (!isAdmin || rulesBusy.current || !rulesLoaded) return;
+    rulesBusy.current = true;
+    setIsRulesSaving(true);
+    try {
+      const data = await onlineRequest<{ rules: { ignoreRoom: boolean; ignoreFaculty: boolean }; version: number }>("/admin/rules", {
+        method: "PUT",
+        body: JSON.stringify({ version: rulesVersion.current, ignoreRoom, ignoreFaculty, [field]: value }),
+      });
+      rulesVersion.current = data.version;
+      applyConflictIgnoreSettings(normalizeConflictIgnoreSettings(data.rules));
+      await fetchConflicts(normalizeConflictIgnoreSettings(data.rules));
+      setToast({ message: "Shared scheduling rules saved for all programs.", showRevert: false });
+    } catch (error) {
+      setToast({ message: (error as Error).message, showRevert: false });
+    } finally {
+      rulesBusy.current = false;
+      setIsRulesSaving(false);
+      loadGlobalRules().catch(() => {});
+    }
+  };
+
   const persistSettings = async (
     settings: CustomizeSettings,
     nextCurriculumState: CurriculumState,
@@ -873,7 +909,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     }
     applyConflictIgnoreSettings(loadedConflictIgnoreSettings);
     setSettingsLoaded(true);
-    return loadedConflictIgnoreSettings;
+    return (await loadGlobalRules()) ?? loadedConflictIgnoreSettings;
   };
 
   const pushUndoAction = (action: UndoAction) => {
@@ -931,7 +967,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   }, []);
 
   useEffect(() => {
-    const liveRefresh = () => { refreshAll().catch(() => {}); };
+    const liveRefresh = () => { loadGlobalRules().then(rules => refreshAll(rules ?? conflictIgnoreSettings)).catch(() => {}); };
     const failedSave = (event: Event) => {
       const message = (event as CustomEvent<string>).detail;
       setIsSaving(false);
@@ -3562,143 +3598,27 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
             <div className="menu-group">
               <button
                 className={`menu-button ${openMenu === "rules" ? "active" : ""}`}
-                title="Online saves always check section, room and faculty bookings across every program. Admin overrides require a reason."
-                disabled
+                title="Shared rules apply to every program. Only administrators can change them. Section overlaps always remain blocked."
+                onClick={() => setOpenMenu(prev => prev === "rules" ? null : "rules")}
                 type="button"
               >
-                Rules enforced
+                Rules{ignoreRoom || ignoreFaculty ? " (ignores active)" : ""} ▼
               </button>
               {openMenu === "rules" ? (
                 <div className="menu-dropdown rules-dropdown" role="menu">
+                  <p>Shared across all programs. {isAdmin ? "Changes save immediately." : "Only administrators can change these settings."}</p>
                   <label className="menu-checkbox">
-                    <input
-                      type="checkbox"
-                      checked={ignoreFaculty}
-                      onChange={(event) => setIgnoreFaculty(event.target.checked)}
-                    />
+                    <input type="checkbox" checked={ignoreFaculty} disabled={!isAdmin || !rulesLoaded || isRulesSaving}
+                      onChange={event => changeGlobalRule("ignoreFaculty", event.target.checked)} />
                     Ignore faculty conflicts
                   </label>
                   <label className="menu-checkbox">
-                    <input
-                      type="checkbox"
-                      checked={ignoreRoom}
-                      onChange={(event) => setIgnoreRoom(event.target.checked)}
-                    />
+                    <input type="checkbox" checked={ignoreRoom} disabled={!isAdmin || !rulesLoaded || isRulesSaving}
+                      onChange={event => changeGlobalRule("ignoreRoom", event.target.checked)} />
                     Ignore room conflicts
                   </label>
-                  <label className="menu-checkbox">
-                    <input
-                      type="checkbox"
-                      checked={ignoreTba}
-                      onChange={(event) => setIgnoreTba(event.target.checked)}
-                    />
-                    Ignore TBA time/day
-                  </label>
-                  <div className="menu-divider" />
-                  <button
-                    className="menu-item"
-                    onClick={() => setShowFacultyRules((prev) => !prev)}
-                    type="button"
-                  >
-                    {showFacultyRules ? "Hide" : "Manage"} Faculty Ignore List…
-                  </button>
-                  {showFacultyRules ? (
-                    <div className="rule-section compact">
-                      <div className="rule-input">
-                        <input
-                          value={facultyInput}
-                          onChange={(event) => setFacultyInput(event.target.value)}
-                          placeholder="Faculty name"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (!facultyInput.trim()) return;
-                            setIgnoreFacultyList((prev) => [...prev, facultyInput.trim()]);
-                            setFacultyInput("");
-                          }}
-                        >
-                          Add
-                        </button>
-                      </div>
-                      <label className="menu-checkbox">
-                        <input
-                          type="checkbox"
-                          checked={containsFaculty}
-                          onChange={(event) => setContainsFaculty(event.target.checked)}
-                        />
-                        Contains match
-                      </label>
-                      <div className="chips">
-                        {ignoreFacultyList.map((item) => (
-                          <span key={item} className="chip">
-                            {item}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setIgnoreFacultyList((prev) =>
-                                  prev.filter((value) => value !== item)
-                                )
-                              }
-                            >
-                              ×
-                            </button>
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-                  <button
-                    className="menu-item"
-                    onClick={() => setShowRoomRules((prev) => !prev)}
-                    type="button"
-                  >
-                    {showRoomRules ? "Hide" : "Manage"} Room Ignore List…
-                  </button>
-                  {showRoomRules ? (
-                    <div className="rule-section compact">
-                      <div className="rule-input">
-                        <input
-                          value={roomInput}
-                          onChange={(event) => setRoomInput(event.target.value)}
-                          placeholder="Room name"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (!roomInput.trim()) return;
-                            setIgnoreRoomList((prev) => [...prev, roomInput.trim()]);
-                            setRoomInput("");
-                          }}
-                        >
-                          Add
-                        </button>
-                      </div>
-                      <label className="menu-checkbox">
-                        <input
-                          type="checkbox"
-                          checked={containsRoom}
-                          onChange={(event) => setContainsRoom(event.target.checked)}
-                        />
-                        Contains match
-                      </label>
-                      <div className="chips">
-                        {ignoreRoomList.map((item) => (
-                          <span key={item} className="chip">
-                            {item}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setIgnoreRoomList((prev) => prev.filter((value) => value !== item))
-                              }
-                            >
-                              ×
-                            </button>
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
+                  <p>Section overlaps are always blocked. TBA resources do not reserve a room or faculty member.</p>
+                  {isRulesSaving ? <p>Saving…</p> : null}
                 </div>
               ) : null}
             </div>

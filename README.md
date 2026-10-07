@@ -45,4 +45,4 @@ Set `COOKIE_SECURE=false` for local HTTP development only. Production uses secur
 - The **File** menu provides program-scoped clearing/import and CSV downloads. Server backups replace database-file Open/Save.
 - CSV exports and timetable PNG export are available in the **Export** group.
 - Conflicts highlight in red in both the grid and text view.
-- Saves block cross-program room/faculty overlaps; admin overrides require a recorded reason. Section overlaps cannot be overridden.
+- Saves block cross-program room/faculty overlaps by default. **Rules** shows shared Ignore room/faculty conflicts switches; only admins can change them. Changes apply to every user/program and are audited and delivered live. When a check remains enabled, admin overrides require a recorded reason. Section overlaps cannot be ignored or overridden.

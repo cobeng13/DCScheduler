@@ -14,7 +14,7 @@ import secrets
 from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, StrictBool, ConfigDict
 from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -500,8 +500,7 @@ def get_settings(program_id: int | None = None, db: Session = Db, user=User):
         program = require_program(db, program_id)
         settings.update(json.loads(program.settings_json))
         version = program.version
-    instance = db.get(models.AppSettings, 1)
-    settings["conflictIgnore"] = json.loads(instance.settings_json) if instance else {}
+    settings["conflictIgnore"], _ = service.scheduling_rules(db)
     return {"settings": settings, "version": version}
 
 
@@ -560,16 +559,44 @@ def put_settings(payload: dict, program_id: int | None = None, db: Session = Db,
         if not isinstance(settings["customize"], dict):
             raise HTTPException(422, "Invalid personal preferences")
         user.preferences_json = bounded_json({"customize": settings["customize"]}, PREFERENCES_BYTES)
-    # Conflict-ignore switches are presentation-only in the online UI and cannot
-    # disable mandatory server booking checks. Global rules have their own API.
+    # Legacy conflictIgnore values are not writable here; global rules use the admin API.
     db.commit()
     return get_settings(program_id, db, user)
 
 
+class SchedulingRulesPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: int = Field(ge=1, strict=True)
+    ignoreRoom: StrictBool
+    ignoreFaculty: StrictBool
+
+
+@api.get("/rules")
+def public_rules(db: Session = Db, user=User):
+    rules, version = service.scheduling_rules(db)
+    return {"rules": rules, "version": version, "section_override": False}
+
+
 @api.get("/admin/rules")
 def get_rules(db: Session = Db, user=Admin):
-    item = db.get(models.AppSettings, 1)
-    return {"rules": json.loads(item.settings_json) if item else {}, "policy": "block", "section_override": False}
+    return public_rules(db, user)
+
+
+@api.put("/admin/rules")
+def put_rules(payload: SchedulingRulesPayload, db: Session = Db, user=Admin):
+    before, version = service.scheduling_rules(db)
+    if payload.version != version:
+        raise HTTPException(409, {"code": "stale_version", "message": "Scheduling rules changed. Review the current settings and try again."})
+    after = payload.model_dump(exclude={"version"})
+    if after != before:
+        item = db.get(models.AppSettings, 1)
+        if item is None:
+            item = models.AppSettings(id=1)
+            db.add(item)
+        item.settings_json = json.dumps({**after, "rulesVersion": version + 1})
+        auth.audit(db, user, "updated", "scheduling_rules", 1, before=before, after=after)
+        db.commit()
+    return public_rules(db, user)
 
 
 @api.post("/file/import-csv")
