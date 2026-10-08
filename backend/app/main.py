@@ -384,7 +384,7 @@ def create_entity(kind: str, payload: EntityPayload, db: Session = Db, user=User
     if cls is models.Section:
         auth.editable(db, user, require_program(db, payload.program_id).id)
     if cls is models.Room and not user.is_admin:
-        raise HTTPException(403, "Only administrators can create rooms")
+        raise HTTPException(403, service.ROOM_CREATE_ADMIN_MESSAGE)
     name = service.label(payload.name)
     if cls is not models.Section and service.normalized(name) == "tba":
         raise HTTPException(422, "TBA is an unassigned resource")

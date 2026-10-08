@@ -6,7 +6,7 @@ import io
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select, func
-from app import auth, models, reports, schemas
+from app import auth, models, reports, schemas, online_service as service
 from app.db import SessionLocal
 from app.limits import BodyLimitMiddleware, MIB
 from app.main import app
@@ -169,6 +169,7 @@ def test_shared_catalog_creation_and_import_permissions(clients, entry_payload, 
     result = alpha.post("/api/file/import-csv?program_id=1&replace=true", files=csv_file([imported]))
     if kind == "rooms":
         assert result.status_code == 422
+        assert result.json()["detail"]["errors"][0]["reason"] == service.ROOM_CREATE_ADMIN_MESSAGE
         assert alpha.get("/api/schedule").json()[0]["id"] == original["id"]
         assert len(alpha.get("/api/sections?program_id=1").json()) == 1
         assert admin.post("/api/file/import-csv?program_id=1&replace=true", files=csv_file([imported])).status_code == 200
@@ -195,3 +196,14 @@ def test_faculty_creation_normalization_and_import_rollback(clients, entry_paylo
     assert "Rollback teacher" not in [f["name"] for f in alpha.get("/api/faculty").json()]
     assert alpha.get("/api/schedule").json() == []
     assert beta.post("/api/file/import-csv?program_id=1", files=csv_file([entry_payload])).status_code == 403
+
+
+def test_room_permission_errors_explain_administrator_requirement(clients, entry_payload):
+    alpha = clients["alpha"]
+    for route in ("/api/rooms", "/api/catalog/rooms"):
+        response = alpha.post(route, json={"name": "New room"})
+        assert response.status_code == 403
+        assert response.json()["detail"] == service.ROOM_CREATE_ADMIN_MESSAGE
+    response = alpha.post("/api/schedule", json={**entry_payload, "Room": "New room"})
+    assert response.status_code == 422
+    assert response.json()["detail"] == service.ROOM_CREATE_ADMIN_MESSAGE

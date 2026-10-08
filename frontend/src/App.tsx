@@ -5054,7 +5054,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
           >
             Add Room
           </button>
-          {!isAdmin && <p className="muted">Only administrators can add rooms.</p>}
+          {!isAdmin && <p className="muted">Only administrators can add new rooms.</p>}
         </aside>
       </div>
     </div>

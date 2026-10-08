@@ -4,6 +4,8 @@ from fastapi import HTTPException
 from sqlalchemy import or_, select
 from . import auth, models, schemas, time_utils
 
+ROOM_CREATE_ADMIN_MESSAGE = "Only administrators can add new rooms. Select an existing room or ask an administrator to add it."
+
 
 def normalized(name):
     result = " ".join(name.strip().casefold().split())
@@ -30,7 +32,7 @@ def entity_json(entity):
     return result
 
 
-def resolve(db, cls, name, program_id=None, create=False):
+def resolve(db, cls, name, program_id=None, create=False, missing_message=None):
     if cls is not models.Section and time_utils.is_tba(name):
         return None
     name = label(name)
@@ -40,7 +42,7 @@ def resolve(db, cls, name, program_id=None, create=False):
     item = db.scalar(stmt)
     if item is None:
         if not create:
-            raise HTTPException(422, f"Select an existing {cls.__name__.lower()}: {name}")
+            raise HTTPException(422, missing_message or f"Select an existing {cls.__name__.lower()}: {name}")
         item = cls(name=name, normalized_name=normalized(name), version=1)
         if cls is models.Section:
             item.program_id = program_id
@@ -119,7 +121,8 @@ def build_candidate(db, user, payload, allow_catalog_add=False):
         raise HTTPException(422, "Select an existing program")
     auth.editable(db, user, program.id)
     section = resolve(db, models.Section, data["section"], program.id, allow_catalog_add)
-    room = resolve(db, models.Room, data["room"], create=allow_catalog_add and user.is_admin)
+    room = resolve(db, models.Room, data["room"], create=allow_catalog_add and user.is_admin,
+                   missing_message=ROOM_CREATE_ADMIN_MESSAGE if not user.is_admin else None)
     faculty = resolve(db, models.Faculty, data["faculty"], create=allow_catalog_add)
     if time_utils.is_tba(data["time_lpu"]) or time_utils.is_tba(data["days"]):
         data.update(time_lpu="TBA", time_24=None, days="TBA", start_minutes=None, end_minutes=None)
