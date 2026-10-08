@@ -92,3 +92,21 @@ test("local preferences are isolated by account and program", () => {
   configure({ ...alpha, id: 3 }, "csrf-test", program);
   assert.equal(scopedStorage.getItem("curriculum"), null);
 });
+
+
+test("signed-in users can add faculty while viewing another program", async () => {
+  configure(alpha, "csrf-test", { ...program, assigned_user_id: 3 });
+  responses.push({ id: 9, name: "New teacher", version: 1 });
+  await schedulerFetch("https://scheduler.test/api/faculty", { method: "POST", body: JSON.stringify({ name: "New teacher" }) });
+  assert.equal(calls.length, 1);
+  await assert.rejects(schedulerFetch("https://scheduler.test/api/rooms", { method: "POST", body: JSON.stringify({ name: "New room" }) }));
+  assert.equal(calls.length, 1);
+});
+
+
+test("administrators can add global rooms with all programs selected", async () => {
+  configure({ ...alpha, is_admin: true }, "csrf-test", null);
+  responses.push({ id: 10, name: "New room", version: 1 });
+  await schedulerFetch("https://scheduler.test/api/rooms", { method: "POST", body: JSON.stringify({ name: "New room" }) });
+  assert.equal(calls.length, 1);
+});

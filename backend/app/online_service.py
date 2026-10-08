@@ -120,7 +120,7 @@ def build_candidate(db, user, payload, allow_catalog_add=False):
     auth.editable(db, user, program.id)
     section = resolve(db, models.Section, data["section"], program.id, allow_catalog_add)
     room = resolve(db, models.Room, data["room"], create=allow_catalog_add and user.is_admin)
-    faculty = resolve(db, models.Faculty, data["faculty"], create=allow_catalog_add and user.is_admin)
+    faculty = resolve(db, models.Faculty, data["faculty"], create=allow_catalog_add)
     if time_utils.is_tba(data["time_lpu"]) or time_utils.is_tba(data["days"]):
         data.update(time_lpu="TBA", time_24=None, days="TBA", start_minutes=None, end_minutes=None)
     else:

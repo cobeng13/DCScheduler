@@ -161,15 +161,37 @@ def test_expired_auth_rows_cleanup_on_failure_and_periodic_job(clients):
 @pytest.mark.parametrize("kind,field", [("rooms", "Room"), ("faculty", "Faculty")])
 def test_shared_catalog_creation_and_import_permissions(clients, entry_payload, kind, field):
     alpha, admin = clients["alpha"], clients["admin"]
-    assert alpha.post(f"/api/{kind}", json={"name": "New shared"}).status_code == 403
-    assert alpha.post(f"/api/catalog/{kind}", json={"name": "New shared"}).status_code == 403
+    expected = 403 if kind == "rooms" else 200
+    assert alpha.post(f"/api/{kind}", json={"name": "New shared"}).status_code == expected
+    assert alpha.post(f"/api/catalog/{kind}", json={"name": "Another shared"}).status_code == expected
     original = alpha.post("/api/schedule", json=entry_payload).json()
-    imported = {**entry_payload, "Section": "Imported", field: "New shared"}
-    assert alpha.post("/api/file/import-csv?program_id=1&replace=true", files=csv_file([imported])).status_code == 422
-    assert alpha.get("/api/schedule").json()[0]["id"] == original["id"]
-    assert len(alpha.get("/api/sections?program_id=1").json()) == 1
-    assert admin.post("/api/file/import-csv?program_id=1&replace=true", files=csv_file([imported])).status_code == 200
-    shared = next(item for item in alpha.get(f"/api/{kind}").json() if item["name"] == "New shared")
+    imported = {**entry_payload, "Section": "Imported", field: "CSV shared"}
+    result = alpha.post("/api/file/import-csv?program_id=1&replace=true", files=csv_file([imported]))
+    if kind == "rooms":
+        assert result.status_code == 422
+        assert alpha.get("/api/schedule").json()[0]["id"] == original["id"]
+        assert len(alpha.get("/api/sections?program_id=1").json()) == 1
+        assert admin.post("/api/file/import-csv?program_id=1&replace=true", files=csv_file([imported])).status_code == 200
+    else:
+        assert result.status_code == 200
+        assert alpha.get("/api/schedule").json()[0]["Faculty"] == "CSV shared"
+    shared = next(item for item in alpha.get(f"/api/{kind}").json() if item["name"] == "CSV shared")
     assert alpha.put(f'/api/{kind}/{shared["id"]}', json={"name": "Renamed", "version": 1}).status_code == 403
     assert alpha.delete(f'/api/{kind}/{shared["id"]}?version=1').status_code == 403
     assert admin.put(f'/api/{kind}/{shared["id"]}', json={"name": "Renamed", "version": 1}).status_code == 200
+
+
+def test_faculty_creation_normalization_and_import_rollback(clients, entry_payload):
+    alpha, beta = clients["alpha"], clients["beta"]
+    faculty = alpha.post("/api/faculty", json={"name": "  New   Teacher "})
+    assert faculty.status_code == 200
+    assert faculty.json()["name"] == "New Teacher"
+    assert beta.get("/api/faculty").json()[-1]["name"] == "New Teacher"
+    assert beta.post("/api/catalog/faculty", json={"name": "NEW TEACHER"}).status_code == 409
+    assert alpha.post("/api/faculty", json={"name": "TBA"}).status_code == 422
+    rows = [{**entry_payload, "Faculty": "Rollback teacher"},
+            {**entry_payload, "Section": "B", "Room": "Not an existing room", "Faculty": "Another teacher"}]
+    assert alpha.post("/api/file/import-csv?program_id=1", files=csv_file(rows)).status_code == 422
+    assert "Rollback teacher" not in [f["name"] for f in alpha.get("/api/faculty").json()]
+    assert alpha.get("/api/schedule").json() == []
+    assert beta.post("/api/file/import-csv?program_id=1", files=csv_file([entry_payload])).status_code == 403

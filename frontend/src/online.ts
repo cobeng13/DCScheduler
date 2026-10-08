@@ -74,7 +74,8 @@ export async function schedulerFetch(input: RequestInfo | URL, init: RequestInit
   const scoped = path === "/schedule" || path === "/sections" || settings || path.startsWith("/file/") || path.startsWith("/reports/");
   if (activeProgram && scoped) url.searchParams.set("program_id", String(activeProgram.id));
   let payload = typeof init.body === "string" ? JSON.parse(init.body) : null;
-  if (mutating && !settings && path !== "/export/png" && !canEdit()) {
+  const sharedCreation = method === "POST" && !!account && (path === "/faculty" || (path === "/rooms" && account.is_admin));
+  if (mutating && !settings && !sharedCreation && path !== "/export/png" && !canEdit()) {
     return failure("This program is read-only. Choose a program assigned to you.");
   }
   if (payload && /^\/(sections|faculty|rooms)$/.test(path) && activeProgram) payload.program_id = activeProgram.id;

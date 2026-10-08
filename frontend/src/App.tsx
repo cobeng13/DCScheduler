@@ -3899,6 +3899,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
             </label>
             <div className="entity-add-row">
               <input
+                disabled={entityEditorConfig.kind === "room" ? !isAdmin : entityEditorConfig.kind === "section" && readOnly}
                 value={newEntityName}
                 onChange={(event) => setNewEntityName(event.target.value)}
                 onKeyDown={(event) => {
@@ -3908,7 +3909,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                 }}
                 placeholder={`New ${entityEditorConfig.label.toLowerCase()} name`}
               />
-              <button type="button" onClick={handleAddEntity}>
+              <button type="button" disabled={entityEditorConfig.kind === "room" ? !isAdmin : entityEditorConfig.kind === "section" && readOnly} onClick={handleAddEntity}>
                 Add
               </button>
             </div>
@@ -5023,6 +5024,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
             Add Section
           </button>
 
+          </fieldset>
           <h3>Add Faculty</h3>
           <label>
             Name
@@ -5042,16 +5044,17 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
           <h3>Add Room</h3>
           <label>
             Name
-            <input value={newRoom} onChange={(event) => setNewRoom(event.target.value)} />
+            <input disabled={!isAdmin} value={newRoom} onChange={(event) => setNewRoom(event.target.value)} />
           </label>
           <button
+            disabled={!isAdmin}
             onClick={() =>
               handleCreateNamed("rooms", newRoom, () => setNewRoom(""), "Room")
             }
           >
             Add Room
           </button>
-          </fieldset>
+          {!isAdmin && <p className="muted">Only administrators can add rooms.</p>}
         </aside>
       </div>
     </div>
