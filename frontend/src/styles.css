@@ -81,8 +81,16 @@ body {
 }
 
 .menu-dropdown.rules-dropdown {
-  min-width: 240px;
+  width: 340px;
+  max-width: calc(100vw - 32px);
+  max-height: 75vh;
+  overflow-y: auto;
 }
+
+.rule-exceptions { margin: 10px 0; }
+.rule-exceptions summary { cursor: pointer; font-weight: 600; }
+.rule-exceptions input[type="search"] { width: 100%; box-sizing: border-box; margin: 6px 0; }
+.rule-exception-list { max-height: 180px; overflow-y: auto; }
 
 .menu-item {
   display: flex;

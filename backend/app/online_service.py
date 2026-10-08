@@ -55,18 +55,34 @@ def scheduling_rules(db):
     item = db.get(models.AppSettings, 1)
     stored = json.loads(item.settings_json) if item else {}
     return {"ignoreRoom": stored.get("ignoreRoom") is True,
-            "ignoreFaculty": stored.get("ignoreFaculty") is True}, stored.get("rulesVersion", 1)
+            "ignoreFaculty": stored.get("ignoreFaculty") is True,
+            "ignoreRoomIds": stored.get("ignoreRoomIds", []),
+            "ignoreFacultyIds": stored.get("ignoreFacultyIds", [])}, stored.get("rulesVersion", 1)
 
 
-def enforced_kinds(db):
+def conflict_policy(db):
     rules, _ = scheduling_rules(db)
-    return ["section"] + ([] if rules["ignoreRoom"] else ["room"]) + ([] if rules["ignoreFaculty"] else ["faculty"])
+    kinds = ["section"] + ([] if rules["ignoreRoom"] else ["room"]) + ([] if rules["ignoreFaculty"] else ["faculty"])
+    return kinds, {"section": set(), "room": set(rules["ignoreRoomIds"]), "faculty": set(rules["ignoreFacultyIds"])}
+
+
+def remove_rule_exception(db, user, kind, resource_id):
+    """Deleted/merged-away resources must not leave unusable rule references."""
+    field = {"rooms": "ignoreRoomIds", "faculty": "ignoreFacultyIds"}.get(kind)
+    if not field:
+        return
+    before, version = scheduling_rules(db)
+    if resource_id not in before[field]:
+        return
+    after = {**before, field: [value for value in before[field] if value != resource_id]}
+    db.get(models.AppSettings, 1).settings_json = json.dumps({**after, "rulesVersion": version + 1})
+    auth.audit(db, user, "updated", "scheduling_rules", 1, before=before, after=after)
 
 
 def candidate_conflicts(db, candidate, entry_id=0):
     if candidate.start_minutes is None:
         return []
-    kinds = enforced_kinds(db)
+    kinds, exceptions = conflict_policy(db)
     days = time_utils.normalize_days(candidate.days)
     result = []
     matches = [models.ScheduleEntry.section_id == candidate.section_id]
@@ -84,14 +100,14 @@ def candidate_conflicts(db, candidate, entry_id=0):
             continue
         for kind in kinds:
             key = f"{kind}_id"
-            if getattr(candidate, key) is not None and getattr(candidate, key) == getattr(other, key):
+            if getattr(candidate, key) is not None and getattr(candidate, key) not in exceptions[kind] and getattr(candidate, key) == getattr(other, key):
                 result.append({"conflict_type": kind, "entry": serialize(other)})
     return result
 
 
 def all_conflicts(db):
     """One database read; compare only bookings sharing a day and resource."""
-    kinds = enforced_kinds(db)
+    kinds, exceptions = conflict_policy(db)
     buckets = {}
     groups = {}
     for entry in db.scalars(select(models.ScheduleEntry)):
@@ -100,7 +116,7 @@ def all_conflicts(db):
         for day in time_utils.normalize_days(entry.days):
             for kind in kinds:
                 resource_id = getattr(entry, kind + "_id")
-                if resource_id is not None:
+                if resource_id is not None and resource_id not in exceptions[kind]:
                     buckets.setdefault((day, kind, resource_id), []).append(entry)
     for (_, kind, _), entries in buckets.items():
         active = []

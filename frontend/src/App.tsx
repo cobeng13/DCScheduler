@@ -90,6 +90,8 @@ type CustomizeSettings = {
   sectionBgColors: Record<string, string>;
 };
 
+type SharedConflictRules = { ignoreRoom: boolean; ignoreFaculty: boolean; ignoreRoomIds: number[]; ignoreFacultyIds: number[] };
+
 type ConflictIgnoreSettings = {
   ignoreFaculty: boolean;
   ignoreRoom: boolean;
@@ -598,6 +600,8 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   const [isFacultyLoadExportOpen, setIsFacultyLoadExportOpen] = useState(false);
   const [facultyLoadExportNames, setFacultyLoadExportNames] = useState<string[]>([]);
   const rulesVersion = useRef(1);
+  const rulesSnapshot = useRef<SharedConflictRules>({ ignoreRoom: false, ignoreFaculty: false, ignoreRoomIds: [], ignoreFacultyIds: [] });
+  const [ruleExceptions, setRuleExceptions] = useState({ ignoreRoomIds: [] as number[], ignoreFacultyIds: [] as number[] });
   const rulesBusy = useRef(false);
   const [isRulesSaving, setIsRulesSaving] = useState(false);
   const [rulesLoaded, setRulesLoaded] = useState(false);
@@ -820,25 +824,29 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   };
 
   const loadGlobalRules = async () => {
-    const data = await onlineRequest<{ rules: { ignoreRoom: boolean; ignoreFaculty: boolean }; version: number }>("/rules");
+    const data = await onlineRequest<{ rules: SharedConflictRules; version: number }>("/rules");
     if (rulesBusy.current || data.version < rulesVersion.current) return;
     rulesVersion.current = data.version;
+    rulesSnapshot.current = data.rules;
+    setRuleExceptions({ ignoreRoomIds: data.rules.ignoreRoomIds, ignoreFacultyIds: data.rules.ignoreFacultyIds });
     const next = normalizeConflictIgnoreSettings(data.rules);
     applyConflictIgnoreSettings(next);
     setRulesLoaded(true);
     return next;
   };
 
-  const changeGlobalRule = async (field: "ignoreRoom" | "ignoreFaculty", value: boolean) => {
+  const changeGlobalRule = async (patch: Partial<SharedConflictRules>) => {
     if (!isAdmin || rulesBusy.current || !rulesLoaded) return;
     rulesBusy.current = true;
     setIsRulesSaving(true);
     try {
-      const data = await onlineRequest<{ rules: { ignoreRoom: boolean; ignoreFaculty: boolean }; version: number }>("/admin/rules", {
+      const data = await onlineRequest<{ rules: SharedConflictRules; version: number }>("/admin/rules", {
         method: "PUT",
-        body: JSON.stringify({ version: rulesVersion.current, ignoreRoom, ignoreFaculty, [field]: value }),
+        body: JSON.stringify({ ...rulesSnapshot.current, ...patch, version: rulesVersion.current }),
       });
       rulesVersion.current = data.version;
+      rulesSnapshot.current = data.rules;
+      setRuleExceptions({ ignoreRoomIds: data.rules.ignoreRoomIds, ignoreFacultyIds: data.rules.ignoreFacultyIds });
       applyConflictIgnoreSettings(normalizeConflictIgnoreSettings(data.rules));
       await fetchConflicts(normalizeConflictIgnoreSettings(data.rules));
       setToast({ message: "Shared scheduling rules saved for all programs.", showRevert: false });
@@ -3602,21 +3610,44 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                 onClick={() => setOpenMenu(prev => prev === "rules" ? null : "rules")}
                 type="button"
               >
-                Rules{ignoreRoom || ignoreFaculty ? " (ignores active)" : ""} ▼
+                Rules{ignoreRoom || ignoreFaculty || ruleExceptions.ignoreRoomIds.length || ruleExceptions.ignoreFacultyIds.length ? " (ignores active)" : ""} ▼
               </button>
               {openMenu === "rules" ? (
                 <div className="menu-dropdown rules-dropdown" role="menu">
                   <p>Shared across all programs. {isAdmin ? "Changes save immediately." : "Only administrators can change these settings."}</p>
                   <label className="menu-checkbox">
                     <input type="checkbox" checked={ignoreFaculty} disabled={!isAdmin || !rulesLoaded || isRulesSaving}
-                      onChange={event => changeGlobalRule("ignoreFaculty", event.target.checked)} />
-                    Ignore faculty conflicts
+                      onChange={event => changeGlobalRule({ ignoreFaculty: event.target.checked })} />
+                    Ignore all faculty conflicts
                   </label>
                   <label className="menu-checkbox">
                     <input type="checkbox" checked={ignoreRoom} disabled={!isAdmin || !rulesLoaded || isRulesSaving}
-                      onChange={event => changeGlobalRule("ignoreRoom", event.target.checked)} />
-                    Ignore room conflicts
+                      onChange={event => changeGlobalRule({ ignoreRoom: event.target.checked })} />
+                    Ignore all room conflicts
                   </label>
+                  <p>To bypass checks for specific resources only, leave the switches above off and select exceptions below. Changes apply to everyone.</p>
+                  {([
+                    { key: "ignoreRoomIds", label: "Room", entities: rooms, search: roomInput, setSearch: setRoomInput },
+                    { key: "ignoreFacultyIds", label: "Faculty", entities: faculty, search: facultyInput, setSearch: setFacultyInput },
+                  ] as const).map(({ key, label, entities, search, setSearch }) => (
+                    <details key={key} className="rule-exceptions">
+                      <summary>{label} exceptions ({ruleExceptions[key].length})</summary>
+                      <input type="search" aria-label={`Search ${label.toLowerCase()} exceptions`} placeholder={`Search ${label.toLowerCase()}…`}
+                        value={search} onChange={event => setSearch(event.target.value)} />
+                      <div className="rule-exception-list">
+                        {entities.filter(entity => entity.name.toLowerCase().includes(search.toLowerCase())).map(entity => (
+                          <label key={entity.id} className="menu-checkbox">
+                            <input type="checkbox" checked={ruleExceptions[key].includes(entity.id)}
+                              disabled={!isAdmin || !rulesLoaded || isRulesSaving}
+                              onChange={event => changeGlobalRule({ [key]: event.target.checked
+                                ? [...ruleExceptions[key], entity.id] : ruleExceptions[key].filter(id => id !== entity.id) })} />
+                            {entity.name}
+                          </label>
+                        ))}
+                        {!entities.some(entity => entity.name.toLowerCase().includes(search.toLowerCase())) && <p>No matching {label.toLowerCase()} records.</p>}
+                      </div>
+                    </details>
+                  ))}
                   <p>A section cannot have two classes at the same time. TBA means no room or faculty is assigned yet.</p>
                   {isRulesSaving ? <p>Saving…</p> : null}
                 </div>

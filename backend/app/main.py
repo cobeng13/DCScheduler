@@ -14,7 +14,7 @@ import secrets
 from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, ValidationError, StrictBool, ConfigDict
+from pydantic import BaseModel, Field, ValidationError, StrictBool, StrictInt, ConfigDict
 from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -430,6 +430,7 @@ def update_entity(kind: str, entity_id: int, payload: EntityPayload, merge: bool
         service.validate_conflicts(db, user, entry, entry.id)
         auth.audit(db, user, "updated", "schedule", entry.id, entry.program_id, old, service.serialize(entry))
     if merge and target.id != item.id:
+        service.remove_rule_exception(db, user, kind, item.id)
         db.delete(item)
     else:
         item.name, item.normalized_name, item.version = name, service.normalized(name), item.version + 1
@@ -461,6 +462,7 @@ def delete_entity(kind: str, entity_id: int, version: int, force: bool = False, 
         service.remove(db, user, entry, entry.version)
     auth.audit(db, user, "deleted", kind, item.id, item.program_id if cls is models.Section else None,
                before=service.entity_json(item))
+    service.remove_rule_exception(db, user, kind, item.id)
     db.delete(item)
     db.commit()
     return {"ok": True}
@@ -569,6 +571,8 @@ class SchedulingRulesPayload(BaseModel):
     version: int = Field(ge=1, strict=True)
     ignoreRoom: StrictBool
     ignoreFaculty: StrictBool
+    ignoreRoomIds: list[StrictInt] | None = Field(default=None, max_length=500)
+    ignoreFacultyIds: list[StrictInt] | None = Field(default=None, max_length=500)
 
 
 @api.get("/rules")
@@ -587,7 +591,14 @@ def put_rules(payload: SchedulingRulesPayload, db: Session = Db, user=Admin):
     before, version = service.scheduling_rules(db)
     if payload.version != version:
         raise HTTPException(409, {"code": "stale_version", "message": "Scheduling rules changed. Review the current settings and try again."})
-    after = payload.model_dump(exclude={"version"})
+    after = {**before, **payload.model_dump(exclude={"version"}, exclude_none=True)}
+    for field, cls in (("ignoreRoomIds", models.Room), ("ignoreFacultyIds", models.Faculty)):
+        ids = after[field]
+        if any(value <= 0 for value in ids) or len(set(ids)) != len(ids):
+            raise HTTPException(422, "Exception lists require unique positive resource IDs")
+        if ids and set(db.scalars(select(cls.id).where(cls.id.in_(ids)))) != set(ids):
+            raise HTTPException(422, "Select existing rooms and faculty for conflict exceptions")
+        after[field] = sorted(ids)
     if after != before:
         item = db.get(models.AppSettings, 1)
         if item is None:

@@ -4,7 +4,7 @@ import { Activity, configure, OnlineUser, Program, request } from "./online";
 import "./online.css";
 
 type Session = { user: OnlineUser; csrf_token: string };
-const fieldLabels: Record<string, string> = { name: "Name", username: "Username", assigned_user_id: "Assigned account", disabled: "Disabled", is_admin: "Administrator", must_change_password: "Password change required", curriculumState: "Curriculum", ignoreRoom: "Ignore room conflicts", ignoreFaculty: "Ignore faculty conflicts" };
+const fieldLabels: Record<string, string> = { name: "Name", username: "Username", assigned_user_id: "Assigned account", disabled: "Disabled", is_admin: "Administrator", must_change_password: "Password change required", curriculumState: "Curriculum", ignoreRoom: "Ignore room conflicts", ignoreFaculty: "Ignore faculty conflicts", ignoreRoomIds: "Room conflict exceptions", ignoreFacultyIds: "Faculty conflict exceptions" };
 const visibleFields = (event: Activity) => event.changed_fields.filter(field => field in fieldLabels || /^[A-Z#]/.test(field));
 
 export default function OnlineApp() {
