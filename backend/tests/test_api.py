@@ -156,7 +156,8 @@ def test_csv_preview_and_replace_are_atomic_and_program_scoped(clients, entry_pa
     assert alpha.post("/api/file/import-csv?program_id=1&replace=true", files=csv_file([good])).status_code == 200
     assert beta.get("/api/schedule?program_id=2").json()[0]["id"] == other["id"]
     assert beta.post("/api/file/reset?program_id=1").status_code == 403
-    assert alpha.post("/api/file/reset?program_id=1").status_code == 200
+    assert alpha.post("/api/file/reset?program_id=1", json={"password": PASSWORD}).status_code == 403
+    assert clients["admin"].post("/api/file/reset?program_id=1", json={"password": PASSWORD}).status_code == 200
     assert len(beta.get("/api/schedule").json()) == 1
 
 

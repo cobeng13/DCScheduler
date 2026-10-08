@@ -21,6 +21,8 @@ class BodyLimitMiddleware:
         limit = 15 * MIB if path == "/api/export/png" else 6 * MIB if path == "/api/file/import-csv" else MIB
         if path == "/api/settings":
             limit = 384 * KIB
+        if path == "/api/admin/database/restore":
+            limit = 12 * MIB
         headers = dict(scope["headers"])
         try:
             size = int(headers.get(b"content-length", b"0"))

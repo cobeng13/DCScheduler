@@ -16,10 +16,11 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, StrictBool, StrictInt, ConfigDict
 from sqlalchemy import delete, func, or_, select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from . import auth, models, online_service as service, reports, schemas
+from . import database_archive as archive
 from .db import SessionLocal
 from .limits import BodyLimitMiddleware, bounded_json, PREFERENCES_BYTES
 
@@ -661,15 +662,105 @@ async def import_csv(file: UploadFile = File(...), program_id: int | None = None
             batch.rollback()
         elif not summary["rows_total"]:
             batch.rollback()
-            raise HTTPException(422, "Empty CSV cannot replace a timetable; use Clear program")
+            raise HTTPException(422, "Empty CSV cannot replace a timetable. Ask an administrator to clear classes in Administration.")
         else:
             auth.audit(db, user, "imported", "csv", program_id=program.id, after={"rows": summary["rows_imported"], "replace": replace})
     db.commit()
     return summary
 
 
+class PasswordConfirmation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    password: str = Field(min_length=1, max_length=256)
+
+
+@api.post("/admin/database/backup")
+def backup_database(db: Session = Db, user=Admin):
+    auth.audit(db, user, "backup_created", "database", security=True)
+    db.flush()
+    file = archive.create(db)
+    try:
+        db.commit()
+    except Exception:
+        file.close()
+        raise
+    async def chunks():
+        try:
+            while chunk := file.read(64 * 1024):
+                yield chunk
+        finally:
+            file.close()
+    filename = f"scheduler-{auth.now():%Y%m%dT%H%M%SZ}.scheduler-backup"
+    return StreamingResponse(chunks(), media_type="application/octet-stream",
+                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@api.post("/admin/database/restore")
+async def restore_database(request: Request, db: Session = Db, user=Admin):
+    archive.reauthenticate(db, user, request.headers.get("X-Admin-Password"))
+    if request.headers.get("X-Restore-Confirmation") != "REPLACE DATABASE":
+        raise HTTPException(422, "Confirm replacement of the entire database")
+    actor = user.username
+    with archive.temporary_file() as file:
+        size = 0
+        try:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > archive.MAX_BYTES:
+                    raise HTTPException(413, "Browser restores support files up to 12 MiB; use the server restore script for larger backups")
+                file.write(chunk)
+            work = asyncio.create_task(asyncio.to_thread(archive.restore, db, file, actor))
+            try:
+                rows = await asyncio.shield(work)
+            except asyncio.CancelledError:
+                # Do not close the file/session while the SQL worker still uses them.
+                try:
+                    await work
+                finally:
+                    db.rollback()
+                raise
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(422, "Backup contains invalid or duplicate records. The current database was not changed.")
+        except OSError:
+            db.rollback()
+            raise HTTPException(507, "Temporary restore storage is full. The current database was not changed.")
+        except SQLAlchemyError:
+            try:
+                db.rollback()
+            except SQLAlchemyError:
+                pass
+            raise HTTPException(503, "Database restore could not be confirmed. Check server health before trying again.")
+        except HTTPException:
+            db.rollback()
+            raise
+    try:
+        health(db)
+    except SQLAlchemyError:
+        raise HTTPException(503, "Database restored, but readiness check failed. Check server health before signing in.")
+    response = Response(content=json.dumps({"ok": True, "rows": rows, "ready": True, "sign_in_required": True}), media_type="application/json")
+    response.delete_cookie(auth.COOKIE, path="/api")
+    return response
+
+
+@api.post("/admin/timetable/clear")
+def clear_timetable(payload: PasswordConfirmation, db: Session = Db, user=Admin):
+    archive.reauthenticate(db, user, payload.password)
+    count = 0
+    for entry in db.scalars(select(models.ScheduleEntry).execution_options(yield_per=200)):
+        service.remove(db, user, entry, entry.version)
+        count += 1
+        if count % 200 == 0:
+            db.flush()
+    auth.audit(db, user, "cleared", "timetable", before={"classes": count}, after={"classes": 0})
+    db.commit()
+    return {"ok": True, "deleted": count}
+
+
 @api.post("/file/reset")
-def clear_program(program_id: int, db: Session = Db, user=User):
+def clear_program(payload: PasswordConfirmation, program_id: int, db: Session = Db, user=Admin):
+    archive.reauthenticate(db, user, payload.password)
     auth.editable(db, user, program_id)
     for entry in list(db.scalars(select(models.ScheduleEntry).where(models.ScheduleEntry.program_id == program_id))):
         service.remove(db, user, entry, entry.version)
@@ -681,7 +772,7 @@ def clear_program(program_id: int, db: Session = Db, user=User):
 @api.api_route("/file/import", methods=["POST"])
 @api.api_route("/file/export", methods=["GET"])
 def database_files(user=User):
-    raise HTTPException(410, "Database-file Open/Save is unavailable online. Use CSV exports or server backups.")
+    raise HTTPException(410, "Legacy database-file Open/Save is unavailable online. Admins can use Administration for full backups and restores; schedules can be exported as CSV.")
 
 
 @api.get("/reports/text.csv")

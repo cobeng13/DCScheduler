@@ -13,6 +13,31 @@ from app.main import app
 from test_migrations import apply_revisions
 
 
+def test_postgres_browser_backup_restore_and_sequences(pg_clients, entry_payload):
+    dependency = app.dependency_overrides[auth.get_db]()
+    try:
+        db = next(dependency)
+        db.get(models.User, 1).is_admin = True
+        db.commit()
+    finally:
+        dependency.close()
+    admin = pg_clients[0]
+    assert admin.post("/api/schedule", json={**entry_payload, "Program": "P0", "Room": "R", "Faculty": "F"}).status_code == 200
+    backup = admin.post("/api/admin/database/backup")
+    assert backup.status_code == 200
+    assert admin.post("/api/rooms", json={"name": "After snapshot"}).status_code == 200
+    restored = admin.post("/api/admin/database/restore", content=backup.content, headers={
+        "X-Admin-Password": "Test-password-123!", "X-Restore-Confirmation": "REPLACE DATABASE"})
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["ready"] is True
+    assert admin.get("/api/schedule").status_code == 401
+    login = admin.post("/api/auth/login", json={"username": "user0", "password": "Test-password-123!"})
+    assert login.status_code == 200
+    admin.headers["X-CSRF-Token"] = login.json()["csrf_token"]
+    assert len(admin.get("/api/schedule").json()) == 1
+    assert admin.post("/api/rooms", json={"name": "After restored snapshot"}).status_code == 200
+
+
 @pytest.fixture
 def pg_clients():
     url = os.getenv("TEST_POSTGRES_URL")

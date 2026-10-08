@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 import App from "./App";
-import { Activity, configure, OnlineUser, Program, request } from "./online";
+import { Activity, configure, downloadDatabaseBackup, OnlineUser, Program, request } from "./online";
 import "./online.css";
 
 type Session = { user: OnlineUser; csrf_token: string };
@@ -58,13 +58,15 @@ export default function OnlineApp() {
   const signOut = () => { setSession(null); setPrograms([]); setProgramId(null); setFeed([]); configure(null, "", null); };
   useEffect(() => {
     request<Session>("/auth/me").then(setSession).catch(() => {}).finally(() => setLoading(false));
+    const openAdmin = () => setAdminOpen(true);
+    window.addEventListener("scheduler-open-admin", openAdmin);
     window.addEventListener("scheduler-session-expired", signOut);
     const reject = (event: PromiseRejectionEvent) => {
       setError(event.reason instanceof Error ? event.reason.message : "Request failed");
       event.preventDefault();
     };
     window.addEventListener("unhandledrejection", reject);
-    return () => { window.removeEventListener("scheduler-session-expired", signOut); window.removeEventListener("unhandledrejection", reject); };
+    return () => { window.removeEventListener("scheduler-open-admin", openAdmin); window.removeEventListener("scheduler-session-expired", signOut); window.removeEventListener("unhandledrejection", reject); };
   }, []);
   useEffect(() => {
     if (!session || session.user.must_change_password) return;
@@ -135,7 +137,7 @@ export default function OnlineApp() {
       <button onClick={async () => { await request("/auth/logout", { method: "POST" }); signOut(); }}>Sign out</button>
     </header>
     {error && <div className="online-error" role="alert">{error} <button onClick={() => setError("")}>Dismiss</button></div>}
-    {adminOpen && <AdminPanel programs={programs} reload={loadPrograms} onError={setError} />}
+    {session.user.is_admin && adminOpen && <AdminPanel programs={programs} reload={loadPrograms} onError={setError} />}
     <div className={`online-layout${activityVisible ? "" : " activity-hidden"}`}>
       <div className="scheduler-workspace">
         {programs.length ? <App key={programId ?? "all"} readOnly={!canEdit} activeProgram={active?.name ?? ""} isAdmin={session.user.is_admin} /> : <div className="account-card">Create programs and accounts in Administration to begin.</div>}
@@ -219,6 +221,73 @@ function AdminPanel({ programs, reload, onError }: { programs: Program[]; reload
       <button onClick={() => run(() => request(`/admin/users/${u.id}`, { method: "PUT", body: JSON.stringify({ disabled: !u.disabled }) }))}>{u.disabled ? "Enable" : "Disable"}</button>
       <button onClick={() => { const password = window.prompt(`New initial password for ${u.username} (12+ characters). This revokes their sessions.`); if (password) run(() => request(`/admin/users/${u.id}`, { method: "PUT", body: JSON.stringify({ password }) })); }}>Reset password</button>
     </div>)}
+    <DatabaseControls />
     <p>Use the Rules menu to turn room and faculty conflict checks on or off for everyone. Only admins can change these settings. A section cannot have two classes at the same time.</p>
+  </section>;
+}
+
+function DatabaseControls() {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const run = async (action: () => Promise<void>) => {
+    if (busy) return;
+    setBusy(true); setError(""); setMessage("");
+    try { await action(); }
+    catch (e) { setError((e as Error).message); }
+    finally { setBusy(false); }
+  };
+  return <section className="database-controls"><h3>Database and timetable</h3>
+    <p>Backups include every program, accounts, password hashes, curricula, settings, and activity history. Keep downloaded backups private. Browser backups support up to 12 MiB; use the server backup scripts for larger databases.</p>
+    <button type="button" disabled={busy} onClick={() => run(async () => {
+      const blob = await downloadDatabaseBackup();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `scheduler-${new Date().toISOString().replace(/[:.]/g, "-")}.scheduler-backup`;
+      document.body.append(link); link.click(); link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 10000);
+      setMessage("Database backup downloaded.");
+    })}>Download full database backup</button>
+    <form onSubmit={e => {
+      e.preventDefault(); const form = e.currentTarget; const data = new FormData(form);
+      const password = String(data.get("password") ?? "");
+      const passwordInput = form.querySelector<HTMLInputElement>('input[name="password"]');
+      if (passwordInput) passwordInput.value = "";
+      run(async () => {
+        if (!file || !file.size || file.size > 12 * 1024 * 1024) throw new Error("Choose a .scheduler-backup file no larger than 12 MiB.");
+        await request("/admin/database/restore", { method: "POST", body: file, headers: {
+          "Content-Type": "application/octet-stream", "X-Admin-Password": password, "X-Restore-Confirmation": "REPLACE DATABASE",
+        } });
+        window.dispatchEvent(new Event("scheduler-session-expired"));
+      });
+    }}><h4>Replace the entire database</h4>
+      <p>This replaces all programs, accounts, schedules, curricula, settings, and history with the uploaded backup. Everyone is signed out. Sign in with an account and password from that backup. Download a current backup first if you need to keep the current data.</p>
+      <p>Upload a .scheduler-backup downloaded here. PostgreSQL .dump files use the server restore script.</p>
+      <input aria-label="Database backup file" type="file" accept=".scheduler-backup" required disabled={busy} onChange={e => setFile(e.target.files?.[0] ?? null)} />
+      <label>Current administrator password<input name="password" type="password" autoComplete="current-password" required maxLength={256} disabled={busy} /></label>
+      <label><input type="checkbox" required disabled={busy} /> I understand this replaces the entire database.</label>
+      <button disabled={busy}>Upload and replace database</button>
+    </form>
+    <form onSubmit={e => {
+      e.preventDefault(); const form = e.currentTarget; const data = new FormData(form);
+      const password = String(data.get("password") ?? "");
+      form.reset();
+      run(async () => {
+        const result = await request<{ deleted: number }>("/admin/timetable/clear", { method: "POST", body: JSON.stringify({ password }) });
+        setMessage(`Timetable cleared: ${result.deleted} classes removed across all programs.`);
+        window.dispatchEvent(new Event("scheduler-refresh"));
+        window.dispatchEvent(new Event("scheduler-feed-refresh"));
+      });
+    }}><h4>Clear current timetable</h4>
+      <p>Removes all scheduled classes across all programs. Accounts, programs, sections, rooms, faculty, curricula, settings, and activity history are kept.</p>
+      <label>Re-type your administrator password<input name="password" type="password" autoComplete="current-password" required maxLength={256} disabled={busy} /></label>
+      <label><input type="checkbox" required disabled={busy} /> I understand this clears classes for every program.</label>
+      <button disabled={busy}>Clear timetable for all programs</button>
+    </form>
+    {busy && <p role="status">Working… Keep this page open until the operation finishes.</p>}
+    {error && <p role="alert">{error}</p>}
+    {message && <p role="status">{message}</p>}
   </section>;
 }

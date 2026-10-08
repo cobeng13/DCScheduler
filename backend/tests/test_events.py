@@ -4,9 +4,10 @@ from starlette.requests import Request
 from app import models
 from app.db import SessionLocal
 from app.main import events
+from conftest import PASSWORD
 
 
-@pytest.mark.parametrize("invalidation", ["disable", "reset", "logout"])
+@pytest.mark.parametrize("invalidation", ["disable", "reset", "logout", "restore"])
 def test_stream_replays_committed_changes_and_revokes_live_sessions(clients, entry_payload, invalidation):
     alpha = clients["alpha"]
     token = alpha.cookies.get("scheduler_session")
@@ -35,6 +36,12 @@ def test_stream_replays_committed_changes_and_revokes_live_sessions(clients, ent
         # Revoking the database session terminates an already-open stream.
         if invalidation == "logout":
             result = alpha.post("/api/auth/logout")
+        elif invalidation == "restore":
+            admin = clients["admin"]
+            backup = admin.post("/api/admin/database/backup")
+            assert backup.status_code == 200
+            result = admin.post("/api/admin/database/restore", content=backup.content, headers={
+                "X-Admin-Password": PASSWORD, "X-Restore-Confirmation": "REPLACE DATABASE"})
         else:
             payload = {"disabled": True} if invalidation == "disable" else {"password": "Reset-password-123!"}
             result = clients["admin"].put("/api/admin/users/2", json=payload)

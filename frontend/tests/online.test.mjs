@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
-import { configure, schedulerFetch, pinVersion, withExpectedVersions, scopedStorage, errorMessage } from "../src/online.ts";
+import { configure, schedulerFetch, pinVersion, withExpectedVersions, scopedStorage, errorMessage, request, downloadDatabaseBackup } from "../src/online.ts";
 
 const alpha = { id: 2, username: "alpha", is_admin: false, disabled: false, must_change_password: false };
 const program = { id: 1, name: "P1", assigned_user_id: 2, version: 1 };
@@ -109,4 +109,30 @@ test("administrators can add global rooms with all programs selected", async () 
   responses.push({ id: 10, name: "New room", version: 1 });
   await schedulerFetch("https://scheduler.test/api/rooms", { method: "POST", body: JSON.stringify({ name: "New room" }) });
   assert.equal(calls.length, 1);
+});
+
+
+test("database backup download uses authenticated same-origin POST and CSRF", async () => {
+  configure({ ...alpha, is_admin: true }, "csrf-test", program);
+  responses.push({ archived: true });
+  const blob = await downloadDatabaseBackup();
+  assert.ok(blob.size > 0);
+  assert.equal(calls[0].url, "/api/admin/database/backup");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.headers["X-CSRF-Token"], "csrf-test");
+  assert.equal(calls[0].init.credentials, "same-origin");
+});
+
+test("database upload preserves raw file content and private confirmation headers", async () => {
+  const file = new Blob(["backup-content"]);
+  responses.push({ ok: true });
+  await request("/admin/database/restore", { method: "POST", body: file, headers: {
+    "Content-Type": "application/octet-stream", "X-Admin-Password": "typed-password", "X-Restore-Confirmation": "REPLACE DATABASE",
+  } });
+  assert.equal(calls[0].init.body, file);
+  assert.equal(calls[0].init.headers.get("Content-Type"), "application/octet-stream");
+  assert.equal(calls[0].init.headers.get("X-CSRF-Token"), "csrf-test");
+  assert.equal(calls[0].init.headers.get("X-Admin-Password"), "typed-password");
+  assert.equal(calls[0].init.credentials, "same-origin");
+  assert.ok(!calls[0].url.includes("typed-password"));
 });

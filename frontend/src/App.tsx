@@ -2681,30 +2681,6 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     refreshAll();
   };
 
-  const handleReset = async () => {
-    const confirmed = window.confirm("This will clear the current timetable. Continue?");
-    if (!confirmed) return;
-    await fetch(`${API_BASE}/file/reset`, { method: "POST" });
-    setSelection(null);
-    setSelectionEnd(null);
-    setContextMenu(null);
-    setSelectionOrigin(null);
-    setSelectedSection("");
-    setSelectedFaculty("");
-    setSelectedRoom("");
-    setTimetableEntries([]);
-    setLastSelection(null);
-    setSelectionEnd(null);
-    setSelectionOrigin(null);
-    setMoveSnapshot(null);
-    setUndoStack([]);
-    setToast(null);
-    setFormEditId(null);
-    setSelectedEntryId(null);
-    setScheduleForm(buildEmptyScheduleForm());
-    refreshAll();
-  };
-
   const handleExportDb = async () => {
     const res = await fetch(`${API_BASE}/reports/text.csv`);
     const blob = await res.blob();
@@ -3382,15 +3358,18 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                 <div className="menu-dropdown" role="menu">
                   <button
                     className="menu-item"
-                    disabled={readOnly}
+                    disabled={!isAdmin}
                     onClick={() => {
-                      handleReset();
+                      window.dispatchEvent(new Event("scheduler-open-admin"));
                       setOpenMenu(null);
                     }}
                     type="button"
                   >
-                    Clear Program
+                    Clear Timetable (Admin)…
                   </button>
+                  {isAdmin && <button className="menu-item" type="button" onClick={() => {
+                    window.dispatchEvent(new Event("scheduler-open-admin")); setOpenMenu(null);
+                  }}>Database Backup / Restore (Admin)…</button>}
                   <button
                     className="menu-item"
                     onClick={() => {

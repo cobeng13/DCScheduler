@@ -53,7 +53,7 @@ export function errorMessage(detail: unknown): string {
 export async function request<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("X-CSRF-Token", csrf);
-  if (init.body && !(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
+  if (typeof init.body === "string") headers.set("Content-Type", "application/json");
   const response = await window.fetch(`/api${path}`, { ...init, headers, credentials: "same-origin" });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
@@ -61,6 +61,18 @@ export async function request<T = unknown>(path: string, init: RequestInit = {})
     throw new Error(errorMessage(body.detail));
   }
   return response.json() as Promise<T>;
+}
+
+export async function downloadDatabaseBackup(): Promise<Blob> {
+  const response = await window.fetch("/api/admin/database/backup", {
+    method: "POST", headers: { "X-CSRF-Token": csrf }, credentials: "same-origin",
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    if (response.status === 401) window.dispatchEvent(new Event("scheduler-session-expired"));
+    throw new Error(errorMessage(body.detail));
+  }
+  return response.blob();
 }
 
 /** Shared transport for the existing scheduler. Every failure rejects, so a

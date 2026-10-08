@@ -42,7 +42,7 @@ Set `COOKIE_SECURE=false` for local HTTP development only. Production uses secur
 - Use **File > Load Curricula** for curriculum catalogs and **Import Timetable CSV** for scheduled classes. Multiple curricula and per-section curriculum overrides are supported. See [CURRICULUM_IMPORTS.md](CURRICULUM_IMPORTS.md) for accepted headers, BSMLS file compatibility, and assignment instructions.
 
 - Production data is stored in a dedicated persistent PostgreSQL volume. A NEW SQLite database at `backend/scheduler.db` can be used for local development.
-- The **File** menu provides program-scoped clearing/import and CSV downloads. Server backups replace database-file Open/Save.
+- The **File** menu provides program-scoped CSV import/download and an admin clear shortcut. In **Administration → Database and timetable**, admins can download a full application backup, upload it to replace the database, or clear classes across all programs. Restore and clear require the current admin password. See [DATABASE_BACKUPS.md](DATABASE_BACKUPS.md).
 - CSV exports and timetable PNG export are available in the **Export** group.
 - Conflicts highlight in red in both the grid and text view.
 - Saves block cross-program room/faculty overlaps by default. **Rules** shows shared Ignore room/faculty conflicts switches; only admins can change them. Expand **Room exceptions** or **Faculty exceptions** to bypass checks for selected records while leaving global ignore switches off. Changes apply to every user/program and are audited and delivered live. When a check remains enabled, admin overrides require a recorded reason. Section overlaps cannot be ignored or overridden.
