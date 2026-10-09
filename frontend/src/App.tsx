@@ -1,5 +1,7 @@
 import { parseCurriculumCsv, normalizeSemester, curriculumTerms, curriculumIdForSection, coursesForSection, coursePlotStatus } from "./curriculum";
 import type { Curriculum, CurriculumCourse, CurriculumState, CurriculumTerm } from "./curriculum";
+import { buildPastedClass, pasteTargetForCell } from "./paste";
+import type { PasteTarget } from "./paste";
 import html2canvas from "html2canvas";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { request as onlineRequest, schedulerFetch as fetch, pinVersion, programName, snapshotVersions, withExpectedVersions, scopedStorage as localStorage } from "./online";
@@ -537,7 +539,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     startMinutes: number;
     endMinutes: number;
   } | null>(null);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; target: PasteTarget } | null>(
     null
   );
   const [blockMenu, setBlockMenu] = useState<{
@@ -2033,32 +2035,28 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     if (target?.closest(".block")) {
       return;
     }
-    if (selectionRange) {
-      if (inGrid) {
-        if (!cell) {
-          setContextMenu({ x: event.clientX, y: event.clientY });
-          return;
-        }
-        const day = cell.dataset.day ?? "";
-        const slot = Number(cell.dataset.slot ?? 0);
-        if (
-          selectionRange.day === day &&
-          slot >= selectionRange.startMinutes &&
-          slot < selectionRange.endMinutes
-        ) {
-          setContextMenu({ x: event.clientX, y: event.clientY });
-        }
-        return;
-      }
-      setContextMenu({ x: event.clientX, y: event.clientY });
+    if (selectionRange && (!inGrid || !cell)) {
+      setContextMenu({ x: event.clientX, y: event.clientY,
+        target: { day: selectionRange.day, startMinutes: selectionRange.startMinutes } });
       return;
     }
     if (!cell) return;
     const day = cell.dataset.day ?? "";
     const slot = Number(cell.dataset.slot ?? 0);
+    const pasteTarget = pasteTargetForCell({ day, startMinutes: slot }, selectionRange);
+    if (selectionRange && selectionRange.day === day &&
+        slot >= selectionRange.startMinutes && slot < selectionRange.endMinutes) {
+      setContextMenu({ x: event.clientX, y: event.clientY,
+        target: pasteTarget });
+      return;
+    }
     const endMinutes = slot + interval;
+    setSelection(null);
+    setSelectionEnd(null);
+    setSelectionOrigin(null);
+    setIsSelecting(false);
     setLastSelection({ day, startMinutes: slot, endMinutes });
-    setContextMenu({ x: event.clientX, y: event.clientY });
+    setContextMenu({ x: event.clientX, y: event.clientY, target: pasteTarget });
   };
 
   const applySelectionToForm = () => {
@@ -2111,59 +2109,76 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   };
 
   const pasteCopiedBlockToCurrentSection = async () => {
-    if (!copiedBlock || isSaving) return;
+    if (!copiedBlock || !contextMenu || isSaving || readOnly) return;
     if (viewMode !== "timetable-section" || !currentViewConfig.selected) {
       setToast({ message: "Paste is available in section timetable view.", showRevert: false });
       setContextMenu(null);
       return;
     }
     const targetSection = currentViewConfig.selected;
-    let payload = withCalculatedHours(
-      withCanonicalCourseDescription({
-        ...copiedBlock,
-        id: 0,
-        Section: targetSection,
-      }),
-      null
-    );
-    const pasteCheck = await checkMoveConflicts(payload, payload);
-    if (!pasteCheck.ok && pasteCheck.reason === "conflict" && pasteCheck.conflicts?.length) {
-      payload = withCalculatedHours(
-        withCanonicalCourseDescription({
-          ...payload,
-          Room: "TBA",
-          Faculty: "TBA",
-        }),
+    const source24 = parseTimeRange(copiedBlock["Time (24 Hrs)"]);
+    const sourceLpu = parseLpuRange(copiedBlock["Time (LPU Std)"]);
+    const sourceStart = source24?.start ?? sourceLpu?.startMinutes;
+    const sourceEnd = source24?.end ?? sourceLpu?.endMinutes;
+    setIsSaving(true);
+    try {
+      let payload = withCalculatedHours(
+        withCanonicalCourseDescription(buildPastedClass(copiedBlock, targetSection,
+          contextMenu.target, sourceStart === undefined || sourceEnd === undefined ? 0 : sourceEnd - sourceStart)),
         null
       );
-    }
-    setIsSaving(true);
-    const createResponse = await fetch(`${API_BASE}/schedule`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const created = await createResponse.json();
-    if (created?.id) {
-      await updateMatchingCourseDescriptions({ ...payload, id: created.id }, created.id);
-      await updateMatchingCourseSectionHours({ ...payload, id: created.id }, created.id);
-      pushUndoAction({
-        type: "add",
-        entryId: created.id,
-        label: `Paste Class: ${payload["Course Code"]}`,
+      const pasteCheck = await checkMoveConflicts(payload, payload);
+      let usedTba = false;
+      if (!pasteCheck.ok && pasteCheck.reason === "conflict" && pasteCheck.conflicts?.length) {
+        if (pasteCheck.conflicts.some((conflict) => conflict.conflict_type === "section")) {
+          throw new Error(buildConflictMessage(pasteCheck.conflicts));
+        }
+        payload = withCalculatedHours(
+          withCanonicalCourseDescription({
+            ...payload,
+            Room: "TBA",
+            Faculty: "TBA",
+          }),
+          null
+        );
+        usedTba = true;
+        const retryCheck = await checkMoveConflicts(payload, payload);
+        if (!retryCheck.ok && retryCheck.conflicts?.length) {
+          throw new Error(buildConflictMessage(retryCheck.conflicts));
+        }
+      }
+      const createResponse = await fetch(`${API_BASE}/schedule`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
       });
-      setToast({
-        message:
-          !pasteCheck.ok && pasteCheck.reason === "conflict"
-            ? `Pasted ${payload["Course Code"]} to ${targetSection} with TBA room/faculty`
-            : `Pasted ${payload["Course Code"]} to ${targetSection}`,
-        showRevert: false,
-      });
+      const created = await createResponse.json();
+      if (created?.id) {
+        await updateMatchingCourseDescriptions({ ...payload, id: created.id }, created.id);
+        await updateMatchingCourseSectionHours({ ...payload, id: created.id }, created.id);
+        pushUndoAction({
+          type: "add",
+          entryId: created.id,
+          label: `Paste Class: ${payload["Course Code"]}`,
+        });
+        setToast({
+          message:
+            usedTba
+              ? `Pasted ${payload["Course Code"]} to ${targetSection} with TBA room/faculty`
+              : `Pasted ${payload["Course Code"]} to ${targetSection}`,
+          showRevert: false,
+        });
+      }
+      setContextMenu(null);
+      setBlockMenu(null);
+      await refreshAll();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not paste the class. Try again.";
+      setToast({ message, showRevert: false });
+      setFormError(message);
+    } finally {
+      setIsSaving(false);
     }
-    setContextMenu(null);
-    setBlockMenu(null);
-    await refreshAll();
-    setIsSaving(false);
   };
 
   const duplicateEntryToNextDay = async (entry: ScheduleEntry, day: string) => {
@@ -4736,7 +4751,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                 >
                   <button onClick={applySelectionToForm}>Add Class</button>
                   {viewMode === "timetable-section" && copiedBlock ? (
-                    <button onClick={pasteCopiedBlockToCurrentSection} disabled={isSaving}>
+                    <button onClick={pasteCopiedBlockToCurrentSection} disabled={readOnly || isSaving}>
                       Paste Copied Class
                     </button>
                   ) : null}
