@@ -35,6 +35,35 @@ test("same-origin transport adds scope and CSRF", async () => {
   assert.equal(calls[0].init.credentials, "same-origin");
 });
 
+test("room timetables always read all programs while other views retain the selected program", async () => {
+  for (const selected of [program, { ...program, id: 2 }, null]) {
+    configure(alpha, "csrf-test", selected);
+    responses.push([{ id: 7, program_id: 1 }, { id: 8, program_id: 2 }]);
+    const response = await schedulerFetch("https://scheduler.test/api/schedule?room=Lab%201&program_id=99");
+    const url = new URL(calls.at(-1).url);
+    assert.equal(url.searchParams.has("program_id"), false);
+    assert.equal(url.searchParams.get("room"), "Lab 1");
+    assert.equal((await response.json()).length, 2);
+  }
+  configure(alpha, "csrf-test", program);
+  for (const query of ["", "?section=1A", "?faculty=Teacher"]) {
+    responses.push([]);
+    await schedulerFetch(`https://scheduler.test/api/schedule${query}`);
+    assert.equal(new URL(calls.at(-1).url).searchParams.get("program_id"), "1");
+  }
+});
+
+test("room CSV exports include all programs without changing program CSV exports", async () => {
+  responses.push({});
+  await schedulerFetch("https://scheduler.test/api/reports/timetable/room.csv?filter_value=Lab%201&program_id=1");
+  const roomUrl = new URL(calls.at(-1).url);
+  assert.equal(roomUrl.searchParams.has("program_id"), false);
+  assert.equal(roomUrl.searchParams.get("filter_value"), "Lab 1");
+  responses.push({});
+  await schedulerFetch("https://scheduler.test/api/reports/text.csv");
+  assert.equal(new URL(calls.at(-1).url).searchParams.get("program_id"), "1");
+});
+
 test("live refresh cannot replace an open form's expected version", async () => {
   responses.push([{ id: 7, version: 1 }]);
   await schedulerFetch("https://scheduler.test/api/schedule");

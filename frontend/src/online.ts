@@ -83,8 +83,12 @@ export async function schedulerFetch(input: RequestInfo | URL, init: RequestInit
   const method = (init.method ?? "GET").toUpperCase();
   const mutating = !["GET", "HEAD"].includes(method);
   const settings = path === "/settings";
+  // Rooms are shared: availability and room exports must include every program.
+  const sharedRoomView = method === "GET" &&
+    ((path === "/schedule" && url.searchParams.has("room")) || path === "/reports/timetable/room.csv");
   const scoped = path === "/schedule" || path === "/sections" || settings || path.startsWith("/file/") || path.startsWith("/reports/");
-  if (activeProgram && scoped) url.searchParams.set("program_id", String(activeProgram.id));
+  if (sharedRoomView) url.searchParams.delete("program_id");
+  else if (activeProgram && scoped) url.searchParams.set("program_id", String(activeProgram.id));
   let payload = typeof init.body === "string" ? JSON.parse(init.body) : null;
   const sharedCreation = method === "POST" && !!account && (path === "/faculty" || (path === "/rooms" && account.is_admin));
   if (mutating && !settings && !sharedCreation && path !== "/export/png" && !canEdit()) {

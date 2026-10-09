@@ -3243,8 +3243,10 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   const effectiveSelection =
     currentViewConfig.selected || currentViewConfig.entities[0]?.name || "";
   const showStartPage =
-    entries.length === 0 &&
-    (sections.length === 0 || (isTimetableView && currentViewConfig.entities.length === 0));
+    viewMode === "timetable-room"
+      ? roomOptions.length === 0
+      : entries.length === 0 &&
+        (sections.length === 0 || (isTimetableView && currentViewConfig.entities.length === 0));
   const canExportTimetable =
     isTimetableView && Boolean(effectiveSelection) && currentViewConfig.entities.length > 0;
   const currentSectionBg =
