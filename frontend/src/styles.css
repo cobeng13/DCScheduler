@@ -347,6 +347,17 @@ body {
   color: #146c43;
 }
 
+.panel input.course-code-over-plotted {
+  color: #a61b1b;
+  border-color: #cf7474;
+  background: #fff1f1;
+  -webkit-text-fill-color: #a61b1b;
+}
+
+.course-plot-status.over-plotted {
+  color: #a61b1b;
+}
+
 .course-code-field {
   position: relative;
 }
@@ -1214,6 +1225,15 @@ body {
 
 .panel .course-code-menu-left button.complete:hover {
   background: #ddf1e5;
+}
+
+.panel .course-code-menu-left button.over-plotted {
+  background: #fff1f1;
+  color: #a61b1b;
+}
+
+.panel .course-code-menu-left button.over-plotted:hover {
+  background: #ffe2e2;
 }
 
 

@@ -1,4 +1,4 @@
-import { parseCurriculumCsv, normalizeSemester, curriculumTerms, curriculumIdForSection, coursesForSection } from "./curriculum";
+import { parseCurriculumCsv, normalizeSemester, curriculumTerms, curriculumIdForSection, coursesForSection, coursePlotStatus } from "./curriculum";
 import type { Curriculum, CurriculumCourse, CurriculumState, CurriculumTerm } from "./curriculum";
 import html2canvas from "html2canvas";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -1321,12 +1321,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     const curriculumCourse = getCurriculumCourse(courseCode, section);
     const plottedHours = getPlottedCourseHours(section, courseCode, excludedEntryId);
     const requiredHours = curriculumCourse?.hours ?? null;
-    return {
-      plottedHours,
-      requiredHours,
-      isComplete:
-        requiredHours !== null && Math.abs(roundHours(plottedHours - requiredHours)) < 0.01,
-    };
+    return coursePlotStatus(plottedHours, requiredHours);
   };
 
   const getCourseCodeOptionLabel = (courseCode: string) => {
@@ -1339,7 +1334,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       status.requiredHours !== null
         ? `${formatHoursLabel(status.plottedHours)}/${formatHoursLabel(status.requiredHours)} hrs plotted`
         : `${formatHoursLabel(status.plottedHours)} hrs plotted`;
-    return [canonicalDescription, plottedLabel].filter(Boolean).join(" - ");
+    return [canonicalDescription, plottedLabel, status.isOverPlotted ? "Over-plotted" : ""].filter(Boolean).join(" - ");
   };
 
   const selectedCoursePlotStatus = getCoursePlotStatus(
@@ -4839,7 +4834,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
             Course Code
             <input
               ref={courseCodeRef}
-              className={selectedCoursePlotStatus.isComplete ? "course-code-complete" : ""}
+              className={selectedCoursePlotStatus.isOverPlotted ? "course-code-over-plotted" : selectedCoursePlotStatus.isComplete ? "course-code-complete" : ""}
               value={scheduleForm["Course Code"]}
               onChange={(event) => {
                 applyCourseCodeToScheduleForm(event.target.value);
@@ -4853,7 +4848,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
             {scheduleForm["Course Code"] ? (
               <div
                 className={`course-plot-status ${
-                  selectedCoursePlotStatus.isComplete ? "complete" : ""
+                  selectedCoursePlotStatus.isOverPlotted ? "over-plotted" : selectedCoursePlotStatus.isComplete ? "complete" : ""
                 }`}
               >
                 {selectedCoursePlotStatus.requiredHours !== null
@@ -4861,6 +4856,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                       selectedCoursePlotStatus.requiredHours
                     )} hrs plotted`
                   : `${formatHoursLabel(selectedCoursePlotStatus.plottedHours)} hrs plotted`}
+                {selectedCoursePlotStatus.isOverPlotted ? " — Over-plotted: exceeds curriculum hours" : ""}
               </div>
             ) : null}
             {isCourseCodeMenuOpen && visibleCourseCodeOptions.length > 0 ? (
@@ -4871,7 +4867,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                     <button
                       key={courseCode}
                       type="button"
-                      className={status.isComplete ? "complete" : ""}
+                      className={status.isOverPlotted ? "over-plotted" : status.isComplete ? "complete" : ""}
                       onMouseDown={(event) => {
                         event.preventDefault();
                         applyCourseCodeToScheduleForm(courseCode);

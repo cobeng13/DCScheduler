@@ -34,6 +34,16 @@ export type CurriculumState = {
 const normalizeMatchValue = (value: string) => value.trim().toLowerCase();
 const roundHours = (value: number) => Math.round(value * 100) / 100;
 
+export function coursePlotStatus(plottedHours: number, requiredHours: number | null) {
+  const difference = requiredHours === null ? null : roundHours(plottedHours - requiredHours);
+  return {
+    plottedHours,
+    requiredHours,
+    isComplete: difference === 0,
+    isOverPlotted: difference !== null && difference > 0,
+  };
+}
+
 export const curriculumTerms: CurriculumTerm[] = ["First Semester", "Second Semester", "Term Break"];
 
 export const normalizeSemester = (value: string): CurriculumTerm | null => {

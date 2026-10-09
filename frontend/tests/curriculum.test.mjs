@@ -1,6 +1,20 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseCurriculumCsv, curriculumIdForSection, coursesForSection } from "../src/curriculum.ts";
+import { parseCurriculumCsv, curriculumIdForSection, coursesForSection, coursePlotStatus } from "../src/curriculum.ts";
+
+test("plotting beyond curriculum hours warns instead of showing incomplete or complete", () => {
+  for (const [plotted, required] of [[4, 3], [8, 6], [3.25, 3]]) {
+    const status = coursePlotStatus(plotted, required);
+    assert.equal(status.isOverPlotted, true);
+    assert.equal(status.isComplete, false);
+  }
+  assert.equal(coursePlotStatus(2, 3).isOverPlotted, false);
+  assert.equal(coursePlotStatus(3, 3).isComplete, true);
+  assert.equal(coursePlotStatus(3, 3).isOverPlotted, false);
+  assert.equal(coursePlotStatus(0.1 + 0.2, 0.3).isComplete, true);
+  assert.equal(coursePlotStatus(8, null).isOverPlotted, false);
+  assert.equal(coursePlotStatus(0, null).isComplete, false);
+});
 
 const combinedHeader = "Year,Semester,Subject Code,Description,Units Lec,Units Lab,Pre-requisite\n";
 
