@@ -75,6 +75,16 @@ export async function downloadDatabaseBackup(): Promise<Blob> {
   return response.blob();
 }
 
+/** One collection keeps program timetables and shared room panes in sync. */
+export async function readSchedule<T extends { id: number; version?: number; program_id?: number }>() {
+  const program = activeProgram;
+  const sharedEntries = await request<T[]>("/schedule");
+  if (activeProgram === program) {
+    for (const entry of sharedEntries) if (entry.version) versions.set(`schedule/${entry.id}`, entry.version);
+  }
+  return { sharedEntries, entries: program ? sharedEntries.filter(entry => entry.program_id === program.id) : sharedEntries };
+}
+
 /** Shared transport for the existing scheduler. Every failure rejects, so a
  * legacy handler cannot silently close a form after a rejected save. */
 export async function schedulerFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
@@ -153,13 +163,14 @@ export async function schedulerFetch(input: RequestInfo | URL, init: RequestInit
       settingsSnapshot = JSON.stringify(data.settings?.curriculumState);
     }
     const kind = path.split("/")[1];
-    for (const item of Array.isArray(data) ? data : [data]) {
+    for (const item of Array.isArray(data) ? data : Array.isArray(data.entries) ? data.entries : [data]) {
       if (item.id && item.version) {
         const key = `${kind}/${item.id}`;
         versions.set(key, item.version);
         if (mutating && pinnedVersions.has(key)) pinnedVersions.set(key, item.version);
       }
     }
+    for (const id of data.removed_ids ?? []) { versions.delete(`schedule/${id}`); pinnedVersions.delete(`schedule/${id}`); }
     if (mutating && path.startsWith("/schedule") && !path.endsWith("/move-check")) overrideReason = null;
   }
   return response;

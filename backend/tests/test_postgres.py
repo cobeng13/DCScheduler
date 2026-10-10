@@ -113,3 +113,45 @@ def test_simultaneous_same_version_updates_only_one_commits(pg_clients, entry_pa
         responses = list(pool.map(update, (0, 1)))
     assert sorted(r.status_code for r in responses) == [200, 409]
     assert pg_clients[0].get(f'/api/schedule/{entry["id"]}').json()["version"] == 2
+
+
+@pytest.mark.parametrize("resource", ["room", "faculty"])
+def test_simultaneous_meeting_moves_recheck_shared_conflicts_and_undo(pg_clients, entry_payload, resource):
+    entries = []
+    for index, client in enumerate(pg_clients):
+        response = client.post('/api/schedule', json={**entry_payload, 'Program': f'P{index}',
+            'Days': 'M,W' if index == 0 else 'Th,F', 'Room': 'R' if resource == 'room' else 'TBA',
+            'Faculty': 'F' if resource == 'faculty' else 'TBA'})
+        assert response.status_code == 200, response.text
+        entries.append(response.json())
+    barrier = Barrier(2)
+    def move(index):
+        barrier.wait(timeout=10)
+        return pg_clients[index].post(f"/api/schedule/{entries[index]['id']}/move", json={
+            'source_day': 'M' if index == 0 else 'Th', 'destination_day': 'T', 'start_minutes': 600,
+            'expected': entries[index]})
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(move, (0, 1)))
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    winner = next(index for index, response in enumerate(responses) if response.status_code == 200)
+    assert len(pg_clients[0].get('/api/schedule').json()) == 3
+    response = pg_clients[winner].post(f"/api/schedule/{entries[winner]['id']}/move/revert", json=responses[winner].json()['snapshot'])
+    assert response.status_code == 200, response.text
+    restored = pg_clients[0].get('/api/schedule').json()
+    assert len(restored) == 2
+    assert [row['Days'] for row in restored] == [row['Days'] for row in entries]
+
+
+def test_simultaneous_moves_of_same_meeting_reject_stale_source(pg_clients, entry_payload):
+    client = pg_clients[0]
+    source = client.post('/api/schedule', json={**entry_payload, 'Program': 'P0', 'Room': 'R', 'Faculty': 'F', 'Days': 'M,W'}).json()
+    barrier = Barrier(2)
+    def move(index):
+        barrier.wait(timeout=10)
+        return client.post(f"/api/schedule/{source['id']}/move", json={
+            'source_day': 'M', 'destination_day': 'T' if index == 0 else 'F', 'start_minutes': 600,
+            'expected': source})
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(move, (0, 1)))
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    assert len(client.get('/api/schedule').json()) == 2

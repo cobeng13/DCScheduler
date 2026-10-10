@@ -19,7 +19,7 @@ from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from . import auth, models, online_service as service, reports, schemas
+from . import auth, models, moves, online_service as service, reports, schemas
 from . import database_archive as archive
 from .db import SessionLocal
 from .limits import BodyLimitMiddleware, bounded_json, PREFERENCES_BYTES
@@ -347,6 +347,20 @@ def delete_schedule(entry_id: int, version: int, db: Session = Db, user=User):
     service.remove(db, user, item, version)
     db.commit()
     return {"ok": True}
+
+
+@api.post("/schedule/{entry_id}/move", response_model=schemas.MeetingMoveResult)
+def move_meeting(entry_id: int, payload: schemas.MeetingMove, override_reason: str | None = Query(default=None, max_length=1200), db: Session = Db, user=User):
+    result = moves.move(db, user, entry_id, payload, override_reason)
+    db.commit()
+    return result
+
+
+@api.post("/schedule/{entry_id}/move/revert")
+def revert_meeting_move(entry_id: int, payload: schemas.MeetingMoveSnapshot, db: Session = Db, user=User):
+    result = moves.revert(db, user, entry_id, payload)
+    db.commit()
+    return result
 
 
 @api.post("/schedule/{entry_id}/move-check")

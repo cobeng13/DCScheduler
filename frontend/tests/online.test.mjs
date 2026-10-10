@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
-import { configure, schedulerFetch, pinVersion, withExpectedVersions, scopedStorage, errorMessage, request, downloadDatabaseBackup } from "../src/online.ts";
+import { configure, schedulerFetch, readSchedule, pinVersion, withExpectedVersions, scopedStorage, errorMessage, request, downloadDatabaseBackup } from "../src/online.ts";
 
 const alpha = { id: 2, username: "alpha", is_admin: false, disabled: false, must_change_password: false };
 const program = { id: 1, name: "P1", assigned_user_id: 2, version: 1 };
@@ -164,4 +164,31 @@ test("database upload preserves raw file content and private confirmation header
   assert.equal(calls[0].init.headers.get("X-Admin-Password"), "typed-password");
   assert.equal(calls[0].init.credentials, "same-origin");
   assert.ok(!calls[0].url.includes("typed-password"));
+});
+
+
+test("atomic move responses refresh versions for every affected class", async () => {
+  responses.push({ entries: [{ id: 1, version: 2 }, { id: 2, version: 1 }], moved_entry_id: 2, snapshot: { move_activity_id: 5 } });
+  await schedulerFetch("https://scheduler.test/api/schedule/1/move", { method: "POST", body: JSON.stringify({ expected: { id: 1, version: 1 } }) });
+  responses.push({});
+  await schedulerFetch("https://scheduler.test/api/schedule/2", { method: "PUT", body: JSON.stringify({}) });
+  assert.equal(JSON.parse(calls[1].init.body).version, 1);
+  responses.push({ entries: [{ id: 1, version: 3 }], removed_ids: [2] });
+  await schedulerFetch("https://scheduler.test/api/schedule/1/move/revert", { method: "POST", body: JSON.stringify({ move_activity_id: 5 }) });
+  responses.push({});
+  await schedulerFetch("https://scheduler.test/api/schedule/1", { method: "PUT", body: JSON.stringify({}) });
+  assert.equal(JSON.parse(calls[3].init.body).version, 3);
+});
+
+
+test("one schedule collection filters the selected program while preserving shared rooms", async () => {
+  responses.push([{ id: 1, program_id: 1, version: 3 }, { id: 2, program_id: 2, version: 4 }]);
+  const result = await readSchedule();
+  assert.deepEqual(result.entries.map(entry => entry.id), [1]);
+  assert.deepEqual(result.sharedEntries.map(entry => entry.id), [1, 2]);
+  assert.equal(calls[0].url, '/api/schedule');
+  assert.equal(calls[0].init.headers.get('X-CSRF-Token'), 'csrf-test');
+  responses.push({});
+  await schedulerFetch('https://scheduler.test/api/schedule/1', { method: 'PUT', body: JSON.stringify({}) });
+  assert.equal(JSON.parse(calls[1].init.body).version, 3);
 });

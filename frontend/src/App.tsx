@@ -4,7 +4,10 @@ import { buildPastedClass, pasteTargetForCell } from "./paste";
 import type { PasteTarget } from "./paste";
 import html2canvas from "html2canvas";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { request as onlineRequest, schedulerFetch as fetch, pinVersion, programName, snapshotVersions, withExpectedVersions, scopedStorage as localStorage } from "./online";
+import { request as onlineRequest, schedulerFetch as fetch, readSchedule, pinVersion, programName, snapshotVersions, withExpectedVersions, scopedStorage as localStorage } from "./online";
+import { ClassEditor } from "./ClassEditor";
+import { TimetablePane } from "./TimetablePane";
+import { assignmentForPane, linkedScrollTop, loadPaneSettings, paneField, type PaneId, type PaneState, type TimetableMode } from "./panes";
 
 type ScheduleEntry = {
   id: number;
@@ -70,8 +73,7 @@ type Selection = {
 
 type MoveSnapshot = {
   previousEntries: ScheduleEntry[];
-  createdEntryId?: number;
-  deletedEntry?: ScheduleEntry;
+  atomic: { move_activity_id: number };
 };
 
 type UndoAction = (
@@ -328,6 +330,7 @@ const parseLpuRange = (range: string) => {
 };
 
 const normalizeMatchValue = (value: string) => value.trim().toLowerCase();
+const draftFingerprint = (entry: ScheduleEntry) => JSON.stringify(canonicalHeaders.filter(field => field !== "# of Hours" && field !== "Time (24 Hrs)").map(field => entry[field]));
 
 const roundHours = (value: number) => Number(value.toFixed(2));
 
@@ -529,9 +532,60 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   const [faculty, setFaculty] = useState<NamedEntity[]>([]);
   const [rooms, setRooms] = useState<NamedEntity[]>([]);
   const [conflicts, setConflicts] = useState<ConflictReport>({ conflicts: [] });
-  const [viewMode, setViewMode] = useState<ViewMode>("timetable-section");
+  const canEditEntry = (entry: ScheduleEntry) => !readOnly && entry.Program === activeProgram;
+  const [sharedEntries, setSharedEntries] = useState<ScheduleEntry[]>([]);
+  const [paneSettings, setPaneSettings] = useState(() => loadPaneSettings(localStorage));
+  const [isTextView, setIsTextView] = useState(false);
+  const [viewportWidth, setViewportWidth] = useState(window.innerWidth);
+  const [workspaceWidth, setWorkspaceWidth] = useState(window.innerWidth);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [scheduleLoaded, setScheduleLoaded] = useState(false);
+  const editorBaseline = useRef("");
+  const leftTimetableRef = useRef<HTMLDivElement>(null);
+  const rightTimetableRef = useRef<HTMLDivElement>(null);
+  const captureTimetableRef = useRef<HTMLDivElement>(null);
+  const splitContainerRef = useRef<HTMLDivElement>(null);
+  const mainRef = useRef<HTMLDivElement>(null);
+  const scrollSyncRef = useRef<PaneId | null>(null);
+  const [capturePane, setCapturePane] = useState<PaneState | null>(null);
+  const activePaneId = paneSettings.active;
+  const activePane = paneSettings[activePaneId];
+  const splitMode = paneSettings.split && !isTextView;
+  const wideSplit = splitMode && viewportWidth >= 900 && workspaceWidth >= 848;
+  const paneRatio = workspaceWidth >= 848 ? Math.max(420 / (workspaceWidth - 8), Math.min(1 - 420 / (workspaceWidth - 8), paneSettings.ratio)) : 0.5;
+  const viewMode: ViewMode = isTextView ? "text" : activePane.mode;
+  const updatePane = (id: PaneId, update: Partial<PaneState>) => setPaneSettings(prev => ({ ...prev, [id]: { ...prev[id], ...update } }));
+  const activatePane = (id: PaneId) => setPaneSettings(prev => prev.active === id ? prev : { ...prev, active: id });
+  const setViewMode = (mode: ViewMode) => {
+    setIsTextView(mode === "text");
+    if (mode !== "text") updatePane(activePaneId, { mode });
+  };
+  useEffect(() => {
+    const resize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", resize);
+    return () => window.removeEventListener("resize", resize);
+  }, []);
+  useEffect(() => {
+    const container = mainRef.current;
+    if (!container) return;
+    const measure = () => {
+      const style = getComputedStyle(container);
+      setWorkspaceWidth(container.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight));
+    };
+    const observer = new ResizeObserver(measure);
+    measure();
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [splitMode]);
+  useEffect(() => { localStorage.setItem("scheduler.panes", JSON.stringify(paneSettings)); }, [paneSettings]);
+  useEffect(() => {
+    const elements = document.querySelectorAll<HTMLElement>(".topbar, .content > .main");
+    elements.forEach(element => { element.inert = splitMode && editorOpen; });
+    return () => elements.forEach(element => { element.inert = false; });
+  }, [splitMode, editorOpen]);
   const [showSunday, setShowSunday] = useState(false);
   const [useQuarterHours, setUseQuarterHours] = useState(false);
+  const [selectionPaneId, setSelectionPaneId] = useState<PaneId>("left");
   const [selection, setSelection] = useState<Selection>(null);
   const [selectionEnd, setSelectionEnd] = useState<Selection>(null);
   const [lastSelection, setLastSelection] = useState<{
@@ -539,7 +593,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     startMinutes: number;
     endMinutes: number;
   } | null>(null);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; target: PasteTarget } | null>(
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; target: PasteTarget; paneId: PaneId } | null>(
     null
   );
   const [blockMenu, setBlockMenu] = useState<{
@@ -547,6 +601,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     y: number;
     entry: ScheduleEntry;
     day: string;
+    paneId: PaneId;
   } | null>(null);
   const [copiedBlock, setCopiedBlock] = useState<ScheduleEntry | null>(null);
   const [filterText, setFilterText] = useState("");
@@ -554,16 +609,15 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     "Course Code"
   );
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
-  const [selectedSection, setSelectedSection] = useState("");
-  const [selectedFaculty, setSelectedFaculty] = useState("");
-  const [selectedRoom, setSelectedRoom] = useState("");
-  const [timetableEntries, setTimetableEntries] = useState<ScheduleEntry[]>([]);
+  const selectedSection = activePane.section;
+  const selectedFaculty = activePane.faculty;
+  const selectedRoom = activePane.room;
+  const setSelectedSection = (section: string | ((previous: string) => string)) => setPaneSettings(prev => ({ ...prev, [prev.active]: { ...prev[prev.active], section: typeof section === "function" ? section(prev[prev.active].section) : section } }));
+  const setSelectedFaculty = (faculty: string | ((previous: string) => string)) => setPaneSettings(prev => ({ ...prev, [prev.active]: { ...prev[prev.active], faculty: typeof faculty === "function" ? faculty(prev[prev.active].faculty) : faculty } }));
+  const setSelectedRoom = (room: string | ((previous: string) => string)) => setPaneSettings(prev => ({ ...prev, [prev.active]: { ...prev[prev.active], room: typeof room === "function" ? room(prev[prev.active].room) : room } }));
   const [scheduleForm, setScheduleForm] = useState<ScheduleEntry>(() =>
     buildEmptyScheduleForm()
   );
-  const [newSection, setNewSection] = useState("");
-  const [newFaculty, setNewFaculty] = useState("");
-  const [newRoom, setNewRoom] = useState("");
   const [formError, setFormError] = useState("");
   const [editEntryId, setEditEntryId] = useState<number | null>(null);
   const [editEntry, setEditEntry] = useState<ScheduleEntry | null>(null);
@@ -577,14 +631,15 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     entry: ScheduleEntry;
     day: string;
     duration: number;
+    paneId: PaneId;
   } | null>(null);
-  const [dragTarget, setDragTarget] = useState<{ day: string; startMinutes: number } | null>(
+  const [dragTarget, setDragTarget] = useState<{ day: string; startMinutes: number; paneId: PaneId } | null>(
     null
   );
   const [toast, setToast] = useState<{ message: string; showRevert: boolean } | null>(null);
   const [moveSnapshot, setMoveSnapshot] = useState<MoveSnapshot | null>(null);
   const [undoStack, setUndoStack] = useState<UndoAction[]>([]);
-  const [zoomPercent, setZoomPercent] = useState(100);
+  const setZoomPercent = (zoom: number) => updatePane(activePaneId, { zoom });
   const [formEditId, setFormEditId] = useState<number | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -667,7 +722,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   const [courseCodeMenuPosition, setCourseCodeMenuPosition] = useState({ top: 0, left: 0 });
   const panelRef = useRef<HTMLDivElement | null>(null);
   const courseCodeRef = useRef<HTMLInputElement | null>(null);
-  const timetableRef = useRef<HTMLDivElement | null>(null);
+  const timetableRef = activePaneId === "left" ? leftTimetableRef : rightTimetableRef;
   const exportCancelRef = useRef(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const customizeModalRef = useRef<HTMLDivElement | null>(null);
@@ -723,7 +778,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   useEffect(() => {
     const storedProgram = localStorage.getItem("lastProgram");
     const storedSection = localStorage.getItem("lastSection");
-    const storedZoom = localStorage.getItem("timetableZoom");
+    const storedZoom = localStorage.getItem("scheduler.panes") ? null : localStorage.getItem("timetableZoom");
     setScheduleForm((prev) => ({
       ...prev,
       Program: activeProgram || storedProgram || prev.Program,
@@ -927,45 +982,23 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   };
 
   const refreshAll = async (conflictSettings: ConflictIgnoreSettings = conflictIgnoreSettings) => {
-    const [scheduleRes, sectionsRes, facultyRes, roomsRes] = await Promise.all([
-      fetch(`${API_BASE}/schedule`),
+    const [schedule, sectionsRes, facultyRes, roomsRes] = await Promise.all([
+      readSchedule<ScheduleEntry>(),
       fetch(`${API_BASE}/sections`),
       fetch(`${API_BASE}/faculty`),
       fetch(`${API_BASE}/rooms`),
     ]);
-    const nextEntries = await scheduleRes.json();
+    const nextEntries = schedule.entries;
     const nextSections = await sectionsRes.json();
     const nextFaculty = await facultyRes.json();
     const nextRooms = await roomsRes.json();
     setEntries(nextEntries);
+    setSharedEntries(schedule.sharedEntries);
     setSections(nextSections);
     setFaculty(nextFaculty);
     setRooms(nextRooms);
-    const nextSection =
-      nextSections.find((section: NamedEntity) => section.name === selectedSection)?.name ??
-      nextSections[0]?.name ??
-      "";
-    const nextFacultyMember =
-      nextFaculty.find((member: NamedEntity) => member.name === selectedFaculty)?.name ??
-      nextFaculty[0]?.name ??
-      "";
-    const nextRoom =
-      nextRooms.find((room: NamedEntity) => room.name === selectedRoom)?.name ??
-      nextRooms[0]?.name ??
-      "";
-    setSelectedSection(nextSection);
-    setSelectedFaculty(nextFacultyMember);
-    setSelectedRoom(nextRoom);
+    setScheduleLoaded(true);
     await fetchConflicts(conflictSettings);
-    if (viewMode.startsWith("timetable")) {
-      const nextSelection =
-        viewMode === "timetable-section"
-          ? nextSection
-          : viewMode === "timetable-faculty"
-            ? nextFacultyMember
-            : nextRoom;
-      await fetchTimetableForSelection(nextSelection, viewMode);
-    }
   };
 
   useEffect(() => {
@@ -1086,23 +1119,6 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       document.removeEventListener("keydown", handleKey);
     };
   }, [isCustomizeOpen]);
-
-  const fetchTimetableForSelection = async (selectionName: string, mode: ViewMode) => {
-    if (!mode.startsWith("timetable") || !selectionName) {
-      setTimetableEntries([]);
-      return;
-    }
-    const params = new URLSearchParams();
-    if (mode === "timetable-section") {
-      params.set("section", selectionName);
-    } else if (mode === "timetable-faculty") {
-      params.set("faculty", selectionName);
-    } else if (mode === "timetable-room") {
-      params.set("room", selectionName);
-    }
-    const res = await fetch(`${API_BASE}/schedule?${params.toString()}`);
-    setTimetableEntries(await res.json());
-  };
 
   const sectionOptions = useMemo(() => sortEntities(sections), [sections]);
   const facultyOptions = useMemo(() => sortEntities(faculty), [faculty]);
@@ -1461,8 +1477,8 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     if (rect) {
       const menuWidth = Math.min(620, window.innerWidth - 32);
       setCourseCodeMenuPosition({
-        top: Math.max(8, rect.top - 40),
-        left: Math.max(8, rect.left - menuWidth - 10),
+        top: splitMode ? Math.min(window.innerHeight - 260, rect.bottom + 4) : Math.max(8, rect.top - 40),
+        left: splitMode ? rect.left : Math.max(8, rect.left - menuWidth - 10),
       });
     }
     setIsCourseCodeMenuOpen(true);
@@ -1689,40 +1705,29 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   ]);
 
   useEffect(() => {
-    if (!viewMode.startsWith("timetable")) {
-      return;
-    }
-    if (currentViewConfig.entities.length === 0) {
-      currentViewConfig.setSelected("");
-      setTimetableEntries([]);
-      return;
-    }
-    const selectedExists = currentViewConfig.entities.some(
-      (entity) => entity.name === currentViewConfig.selected
-    );
-    if (!selectedExists) {
-      currentViewConfig.setSelected(currentViewConfig.entities[0].name);
-    }
-  }, [viewMode, currentViewConfig]);
-
-  useEffect(() => {
-    if (!viewMode.startsWith("timetable")) {
-      return;
-    }
-    if (!currentViewConfig.selected) {
-      setTimetableEntries([]);
-      return;
-    }
-    fetchTimetableForSelection(currentViewConfig.selected, viewMode);
-  }, [viewMode, currentViewConfig.selected]);
+    if (!scheduleLoaded) return;
+    setPaneSettings(prev => {
+      const next = { ...prev };
+      let changed = false;
+      for (const id of ["left", "right"] as const) {
+        const pane = { ...prev[id] };
+        for (const [kind, options] of [["section", sectionOptions], ["faculty", facultyOptions], ["room", roomOptions]] as const) {
+          if (!options.some(entity => entity.name === pane[kind])) {
+            const name = options[0]?.name ?? "";
+            if (pane[kind] !== name) { pane[kind] = name; changed = true; }
+          }
+        }
+        next[id] = pane;
+      }
+      return changed ? next : prev;
+    });
+  }, [scheduleLoaded, sectionOptions, facultyOptions, roomOptions]);
 
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        if (dragging) {
-          setDragging(null);
-          setDragTarget(null);
-        }
+        setDragging(null);
+        setDragTarget(null);
         setLastSelection(null);
         setSelection(null);
         setSelectionEnd(null);
@@ -1781,7 +1786,9 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     return list;
   }, [interval]);
 
-  const handleSelectStart = (event: React.MouseEvent, day: string, index: number) => {
+  const handleSelectStart = (event: React.MouseEvent, day: string, index: number, paneId: PaneId) => {
+    activatePane(paneId);
+    setSelectionPaneId(paneId);
     if (event.button !== 0) return;
     setSelection({ day, startIndex: index, endIndex: index });
     setSelectionEnd({ day, startIndex: index, endIndex: index });
@@ -1816,21 +1823,22 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     setSelectionOrigin(null);
   };
 
-  const handleDragStart = (entry: ScheduleEntry, day: string) => {
-    if (readOnly) return;
+  const handleDragStart = (entry: ScheduleEntry, day: string, paneId: PaneId) => {
+    if (!canEditEntry(entry) || isSaving || editorOpen || isExporting) return;
+    activatePane(paneId);
     const parsed = parseTimeRange(entry["Time (24 Hrs)"]);
     if (!parsed) return;
     const { start, end } = parsed;
-    setDragging({ entry, day, duration: end - start });
-    setDragTarget({ day, startMinutes: start });
+    setDragging({ entry, day, duration: end - start, paneId });
+    setDragTarget({ day, startMinutes: start, paneId });
     setToast(null);
     setMoveSnapshot(null);
   };
 
-  const handleDragOver = (event: React.DragEvent, day: string, slot: number) => {
+  const handleDragOver = (event: React.DragEvent, day: string, slot: number, paneId: PaneId) => {
     event.preventDefault();
     if (!dragging) return;
-    setDragTarget({ day, startMinutes: slot });
+    setDragTarget({ day, startMinutes: slot, paneId });
   };
 
   const formatDaysForDisplay = (days: string) => {
@@ -1864,7 +1872,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     return `${lead}: conflicts with ${details.join(" | ")}.`;
   };
 
-  const checkMoveConflicts = async (entry: ScheduleEntry, payload: ScheduleEntry) => {
+  const checkMoveConflicts = async (entry: ScheduleEntry, payload: ScheduleEntry): Promise<MoveCheckResponse> => {
     const params = new URLSearchParams();
     params.set("ignore_faculty", String(ignoreFaculty));
     params.set("ignore_room", String(ignoreRoom));
@@ -1877,7 +1885,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     }
     params.set("contains_faculty", String(containsFaculty));
     params.set("contains_room", String(containsRoom));
-    const response = await fetch(
+    return await requestJson(
       `${API_BASE}/schedule/${entry.id}/move-check?${params.toString()}`,
       {
         method: "POST",
@@ -1885,131 +1893,106 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
         body: JSON.stringify(payload),
       }
     );
-    if (!response.ok) {
-      return { ok: true } as MoveCheckResponse;
-    }
-    return (await response.json()) as MoveCheckResponse;
+
   };
 
-  const handleDrop = async () => {
-    if (readOnly) return;
-    if (!dragging || !dragTarget) return;
-    const { entry, day: originDay, duration } = dragging;
-    const startMinutes = dragTarget.startMinutes;
-    const endMinutes = startMinutes + duration;
-    const newTime24 = toTimeRange24(startMinutes, endMinutes);
-    const newTimeLpu = toLpuLabel(startMinutes, endMinutes);
-    const days = normalizeDays(entry.Days).split(",").filter(Boolean);
-    const payloadBase = {
-      ...entry,
-      Days: dragTarget.day,
-      "Time (24 Hrs)": newTime24,
-      "Time (LPU Std)": newTimeLpu,
-    };
-
-    const snapshot: MoveSnapshot = { previousEntries: [entry] };
-
-    const moveCheck = await checkMoveConflicts(entry, payloadBase);
-    if (!moveCheck.ok && moveCheck.reason === "conflict" && moveCheck.conflicts?.length) {
-      setToast({ message: buildConflictMessage(moveCheck.conflicts), showRevert: false });
-      setDragging(null);
-      setDragTarget(null);
-      return;
+  const requestJson = async (url: string, options: RequestInit) => {
+    const response = await fetch(url, options);
+    const body = await response.json().catch(() => null);
+    if (!response.ok) {
+      const detail = body?.detail;
+      throw new Error(typeof detail === "string" ? detail : detail?.conflicts?.length ? buildConflictMessage(detail.conflicts) : detail?.message ?? "Could not save changes.");
     }
+    return body;
+  };
 
-    if (isSaving) return;
+  const handleDrop = async (paneId: PaneId) => {
+    if (!dragging || !canEditEntry(dragging.entry) || !dragTarget || dragTarget.paneId !== paneId || isSaving) return;
+    const destination = paneSettings[paneId];
+    activatePane(paneId);
+    const assignment = assignmentForPane(destination);
+    const { entry, day } = dragging;
+    if (!assignment.name || dragTarget.startMinutes < 420 || dragTarget.startMinutes + dragging.duration > 1260) {
+      setToast({ message: "Choose a destination and a time between 7 AM and 9 PM.", showRevert: false });
+      setDragging(null); setDragTarget(null); return;
+    }
     setIsSaving(true);
-    const operations: Record<string, unknown>[] = [];
-    if (days.length > 1) {
-      const remaining = days.filter((token) => token !== originDay);
-      if (remaining.length > 0) {
-        operations.push({ method: "PUT", id: entry.id, entry: { ...entry, Days: remaining.join(",") } });
-      } else {
-        operations.push({ method: "DELETE", id: entry.id, version: entry.version });
-        snapshot.deletedEntry = entry;
+    try {
+      const result = await requestJson(`${API_BASE}/schedule/${entry.id}/move`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source_day: day, destination_day: dragTarget.day, start_minutes: dragTarget.startMinutes,
+          assignment: dragging.paneId !== paneId ? assignment : null, expected: entry }),
+      });
+      if (result.snapshot) {
+        const snapshot: MoveSnapshot = { previousEntries: [entry], atomic: result.snapshot };
+        setMoveSnapshot(snapshot);
+        pushUndoAction({ type: "move", snapshot, label: "Move Class" });
+        setSelectedEntryId(result.moved_entry_id);
+        setToast({ message: "Class moved", showRevert: true });
+        await refreshAll();
       }
-      const { id: _id, ...createPayload } = payloadBase;
-      operations.push({ method: "POST", entry: createPayload });
-    } else {
-      operations.push({ method: "PUT", id: entry.id, entry: payloadBase });
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : "Move failed", showRevert: false });
+    } finally {
+      setDragging(null); setDragTarget(null); setLastSelection(null); setSelection(null);
+      setSelectionEnd(null); setSelectionOrigin(null); setIsSaving(false);
     }
-    const response = await fetch(`${API_BASE}/schedule/batch`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operations }) });
-    const changed = await response.json() as ScheduleEntry[];
-    if (days.length > 1) snapshot.createdEntryId = changed[changed.length - 1].id;
-
-    setMoveSnapshot(snapshot);
-    pushUndoAction({ type: "move", snapshot, label: "Move Class" });
-    await refreshAll();
-    setDragging(null);
-    setDragTarget(null);
-    setLastSelection(null);
-    setSelection(null);
-    setSelectionEnd(null);
-    setSelectionOrigin(null);
-    setIsSaving(false);
   };
 
   const revertMoveSnapshot = async (snapshot: MoveSnapshot) => {
-    const operations: Record<string, unknown>[] = [];
-    if (snapshot.createdEntryId) {
-      operations.push({ method: "DELETE", id: snapshot.createdEntryId });
-    }
-    if (snapshot.deletedEntry) {
-      const { id, ...rest } = snapshot.deletedEntry;
-      operations.push({ method: "POST", entry: rest });
-    }
-    for (const entry of snapshot.previousEntries) {
-      if (entry.id !== snapshot.deletedEntry?.id) operations.push({ method: "PUT", id: entry.id, entry });
-    }
-    await fetch(`${API_BASE}/schedule/batch`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operations }) });
+    await requestJson(`${API_BASE}/schedule/${snapshot.previousEntries[0].id}/move/revert`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(snapshot.atomic),
+    });
   };
 
   const handleRevertMove = async () => {
-    if (!moveSnapshot) return;
-    if (isSaving) return;
+    if (readOnly) return;
+    if (!moveSnapshot || isSaving) return;
     setIsSaving(true);
-    const action = undoStack.find(action => action.type === "move" && action.snapshot === moveSnapshot);
-    withExpectedVersions(action?.expectedVersions ?? null);
-    try { await revertMoveSnapshot(moveSnapshot); }
-    finally { withExpectedVersions(null); setIsSaving(false); }
-    setMoveSnapshot(null);
-    setToast({ message: "Move reverted", showRevert: false });
-    await refreshAll();
-    setIsSaving(false);
+    try {
+      await revertMoveSnapshot(moveSnapshot);
+      setUndoStack(prev => prev.filter(action => action.type !== "move" || action.snapshot !== moveSnapshot));
+      setMoveSnapshot(null);
+      setSelectedEntryId(moveSnapshot.previousEntries[0].id);
+      setToast({ message: "Move reverted", showRevert: false });
+      await refreshAll();
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : "Could not revert move", showRevert: false });
+    } finally { setIsSaving(false); }
   };
 
   const handleUndo = async () => {
+    if (readOnly) return;
     if (undoStack.length === 0 || isSaving) return;
     const [action, ...rest] = undoStack;
     setIsSaving(true);
     withExpectedVersions(action.expectedVersions ?? null);
     try {
-    if (action.type === "add") {
-      await fetch(`${API_BASE}/schedule/${action.entryId}`, { method: "DELETE" });
-    } else if (action.type === "delete") {
-      const { id, ...restEntry } = action.entry;
-      await fetch(`${API_BASE}/schedule`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(restEntry),
-      });
-    } else if (action.type === "edit") {
-      await fetch(`${API_BASE}/schedule/${action.entry.id}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(action.entry),
-      });
-    } else if (action.type === "move") {
-      await revertMoveSnapshot(action.snapshot);
-    }
-    setUndoStack(rest);
-    setToast({ message: `Undid: ${action.label}`, showRevert: false });
-    await refreshAll();
-    setIsSaving(false);
-    } finally {
-      withExpectedVersions(null);
-      setIsSaving(false);
-    }
+      if (action.type === "add") {
+        await requestJson(`${API_BASE}/schedule/${action.entryId}`, { method: "DELETE" });
+      } else if (action.type === "delete") {
+        const { id, ...restEntry } = action.entry;
+        await requestJson(`${API_BASE}/schedule`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(restEntry),
+        });
+      } else if (action.type === "edit") {
+        await requestJson(`${API_BASE}/schedule/${action.entry.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(action.entry),
+        });
+      } else if (action.type === "move") {
+        await revertMoveSnapshot(action.snapshot);
+      }
+      setUndoStack(rest);
+      setMoveSnapshot(null);
+      setToast({ message: `Undid: ${action.label}`, showRevert: false });
+      await refreshAll();
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : "Undo failed", showRevert: false });
+    } finally { withExpectedVersions(null); setIsSaving(false); }
   };
 
   const selectionRange = useMemo(() => {
@@ -2027,7 +2010,8 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     return lastSelection;
   }, [isSelecting, selectionOrigin, selectionEnd, lastSelection, slots, interval]);
 
-  const handleContextMenu = (event: React.MouseEvent) => {
+  const handleContextMenu = (event: React.MouseEvent, paneId: PaneId) => {
+    activatePane(paneId);
     event.preventDefault();
     const target = event.target as HTMLElement | null;
     const cell = target?.closest<HTMLElement>("[data-day][data-slot]");
@@ -2035,18 +2019,18 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     if (target?.closest(".block")) {
       return;
     }
-    if (selectionRange && (!inGrid || !cell)) {
-      setContextMenu({ x: event.clientX, y: event.clientY,
+    if (selectionPaneId === paneId && selectionRange && (!inGrid || !cell)) {
+      setContextMenu({ x: event.clientX, y: event.clientY, paneId,
         target: { day: selectionRange.day, startMinutes: selectionRange.startMinutes } });
       return;
     }
     if (!cell) return;
     const day = cell.dataset.day ?? "";
     const slot = Number(cell.dataset.slot ?? 0);
-    const pasteTarget = pasteTargetForCell({ day, startMinutes: slot }, selectionRange);
-    if (selectionRange && selectionRange.day === day &&
+    const pasteTarget = pasteTargetForCell({ day, startMinutes: slot }, selectionPaneId === paneId ? selectionRange : null);
+    if (selectionPaneId === paneId && selectionRange && selectionRange.day === day &&
         slot >= selectionRange.startMinutes && slot < selectionRange.endMinutes) {
-      setContextMenu({ x: event.clientX, y: event.clientY,
+      setContextMenu({ x: event.clientX, y: event.clientY, paneId,
         target: pasteTarget });
       return;
     }
@@ -2055,12 +2039,18 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     setSelectionEnd(null);
     setSelectionOrigin(null);
     setIsSelecting(false);
+    setSelectionPaneId(paneId);
     setLastSelection({ day, startMinutes: slot, endMinutes });
-    setContextMenu({ x: event.clientX, y: event.clientY, target: pasteTarget });
+    setContextMenu({ x: event.clientX, y: event.clientY, paneId, target: pasteTarget });
   };
 
   const applySelectionToForm = () => {
-    if (!selectionRange) return;
+    if (!selectionRange || selectionPaneId !== activePaneId) return;
+    if (splitMode) {
+      openAddClass(activePaneId);
+      setContextMenu(null);
+      return;
+    }
     const time24 = `${formatMinutes(selectionRange.startMinutes)}-${formatMinutes(
       selectionRange.endMinutes
     )}`;
@@ -2070,6 +2060,8 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     setScheduleForm({
       ...buildEmptyScheduleForm(),
       Section: viewMode === "timetable-section" ? currentViewConfig.selected : "",
+      Faculty: viewMode === "timetable-faculty" ? currentViewConfig.selected : "",
+      Room: viewMode === "timetable-room" ? currentViewConfig.selected : "",
       "Time (24 Hrs)": time24,
       "Time (LPU Std)": toLpuLabel(selectionRange.startMinutes, selectionRange.endMinutes),
       Days: selectionRange.day,
@@ -2092,10 +2084,12 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   const handleBlockContextMenu = (
     event: React.MouseEvent,
     entry: ScheduleEntry,
-    day: string
+    day: string,
+    paneId: PaneId
   ) => {
     event.preventDefault();
-    setBlockMenu({ x: event.clientX, y: event.clientY, entry, day });
+    activatePane(paneId);
+    setBlockMenu({ x: event.clientX, y: event.clientY, entry, day, paneId });
   };
 
   const copyBlock = () => {
@@ -2109,7 +2103,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   };
 
   const pasteCopiedBlockToCurrentSection = async () => {
-    if (!copiedBlock || !contextMenu || isSaving || readOnly) return;
+    if (!copiedBlock || isSaving || readOnly) return;
     if (viewMode !== "timetable-section" || !currentViewConfig.selected) {
       setToast({ message: "Paste is available in section timetable view.", showRevert: false });
       setContextMenu(null);
@@ -2123,8 +2117,8 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     setIsSaving(true);
     try {
       let payload = withCalculatedHours(
-        withCanonicalCourseDescription(buildPastedClass(copiedBlock, targetSection,
-          contextMenu.target, sourceStart === undefined || sourceEnd === undefined ? 0 : sourceEnd - sourceStart)),
+        withCanonicalCourseDescription(buildPastedClass({ ...copiedBlock, Program: activeProgram }, targetSection,
+          (contextMenu?.paneId === activePaneId ? contextMenu.target : selectionPaneId === activePaneId && selectionRange ? { day: selectionRange.day, startMinutes: selectionRange.startMinutes } : { day: normalizeDays(copiedBlock.Days).split(",")[0], startMinutes: sourceStart ?? 0 }), sourceStart === undefined || sourceEnd === undefined ? 0 : sourceEnd - sourceStart)),
         null
       );
       const pasteCheck = await checkMoveConflicts(payload, payload);
@@ -2182,47 +2176,50 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   };
 
   const duplicateEntryToNextDay = async (entry: ScheduleEntry, day: string) => {
+    if (!canEditEntry(entry)) return;
     if (isSaving) return;
-    const nextDay = getNextDay(day);
-    if (!nextDay) return;
-    const payload = withCalculatedHours(
-      withCanonicalCourseDescription({
-        ...entry,
-        id: 0,
-        Days: nextDay,
-      }),
-      null
-    );
-    const duplicateCheck = await checkMoveConflicts(payload, payload);
-    if (
-      !duplicateCheck.ok &&
-      duplicateCheck.reason === "conflict" &&
-      duplicateCheck.conflicts?.length
-    ) {
-      setToast({ message: buildConflictMessage(duplicateCheck.conflicts), showRevert: false });
-      setBlockMenu(null);
-      return;
-    }
-    setIsSaving(true);
-    const createResponse = await fetch(`${API_BASE}/schedule`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const created = await createResponse.json();
-    if (created?.id) {
-      await updateMatchingCourseDescriptions({ ...payload, id: created.id }, created.id);
-      await updateMatchingCourseSectionHours({ ...payload, id: created.id }, created.id);
-      pushUndoAction({
-        type: "add",
-        entryId: created.id,
-        label: `Duplicate Class: ${entry["Course Code"]}`,
+    try {
+      const nextDay = getNextDay(day);
+      if (!nextDay) return;
+      const payload = withCalculatedHours(
+        withCanonicalCourseDescription({
+          ...entry,
+          id: 0,
+          Days: nextDay,
+        }),
+        null
+      );
+      const duplicateCheck = await checkMoveConflicts(payload, payload);
+      if (
+        !duplicateCheck.ok &&
+        duplicateCheck.reason === "conflict" &&
+        duplicateCheck.conflicts?.length
+      ) {
+        setToast({ message: buildConflictMessage(duplicateCheck.conflicts), showRevert: false });
+        setBlockMenu(null);
+        return;
+      }
+      setIsSaving(true);
+      const created = await requestJson(`${API_BASE}/schedule`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
       });
-      setToast({ message: `Duplicated to ${dayLabels[nextDay]}`, showRevert: false });
-    }
-    setBlockMenu(null);
-    await refreshAll();
-    setIsSaving(false);
+      if (created?.id) {
+        await updateMatchingCourseDescriptions({ ...payload, id: created.id }, created.id);
+        await updateMatchingCourseSectionHours({ ...payload, id: created.id }, created.id);
+        pushUndoAction({
+          type: "add",
+          entryId: created.id,
+          label: `Duplicate Class: ${entry["Course Code"]}`,
+        });
+        setToast({ message: `Duplicated to ${dayLabels[nextDay]}`, showRevert: false });
+      }
+      setBlockMenu(null);
+      await refreshAll();
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : "Could not save class", showRevert: false });
+    } finally { setIsSaving(false); }
   };
 
   const resetScheduleFormFields = () => {
@@ -2235,8 +2232,11 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   };
 
   const enterEditMode = (entry: ScheduleEntry) => {
-    if (readOnly) return;
+    if (!canEditEntry(entry)) return;
     pinVersion("schedule", entry.id, entry.version);
+    if (isSaving) return;
+    editorBaseline.current = draftFingerprint(entry);
+    if (splitMode) setEditorOpen(true);
     setFormEditId(entry.id);
     setScheduleForm(entry);
     setFormError("");
@@ -2251,6 +2251,9 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   };
 
   const cancelEditMode = () => {
+    if (isSaving) return;
+    if (editorOpen && editorBaseline.current && draftFingerprint(scheduleForm) !== editorBaseline.current && !window.confirm("Discard unsaved class changes?")) return;
+    setEditorOpen(false);
     setFormEditId(null);
     setFormError("");
     setSelectedEntryId(null);
@@ -2272,52 +2275,56 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       return;
     }
     setIsSaving(true);
-    const payload = withCalculatedHours(
-      withCanonicalCourseDescription({ ...scheduleForm, Days: normalizedDays }),
-      formEditId
-    );
-    await ensureEntityExists("sections", payload.Section, sections);
-    await ensureEntityExists("faculty", payload.Faculty, faculty);
-    await ensureEntityExists("rooms", payload.Room, rooms);
-    const editCheck = await checkMoveConflicts(
-      { ...payload, id: formEditId } as ScheduleEntry,
-      payload
-    );
-    if (!editCheck.ok && editCheck.reason === "conflict" && editCheck.conflicts?.length) {
-      setFormError(buildConflictMessage(editCheck.conflicts));
-      setIsSaving(false);
-      return;
-    }
-    await fetch(`${API_BASE}/schedule/${formEditId}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    await updateMatchingCourseDescriptions(payload, formEditId);
-    await updateMatchingCourseSectionHours(payload, formEditId);
-    if (
-      previousEntry &&
-      (normalizeMatchValue(previousEntry.Section) !== normalizeMatchValue(payload.Section) ||
-        normalizeMatchValue(previousEntry["Course Code"]) !==
-          normalizeMatchValue(payload["Course Code"]))
-    ) {
-      await updateCourseSectionHoursAfterRemoval(previousEntry);
-    }
-    setFormEditId(null);
-    setToast({ message: formEditId ? "Class updated" : "Class added", showRevert: false });
-    if (previousEntry) {
-      pushUndoAction({
-        type: "edit",
-        entry: previousEntry,
-        label: `Edit Class: ${previousEntry["Course Code"]}`,
+    try {
+      const payload = withCalculatedHours(
+        withCanonicalCourseDescription({ ...scheduleForm, Days: normalizedDays }),
+        formEditId
+      );
+      await ensureEntityExists("sections", payload.Section, sections);
+      await ensureEntityExists("faculty", payload.Faculty, faculty);
+      await ensureEntityExists("rooms", payload.Room, rooms);
+      const editCheck = await checkMoveConflicts(
+        { ...payload, id: formEditId } as ScheduleEntry,
+        payload
+      );
+      if (!editCheck.ok && editCheck.reason === "conflict" && editCheck.conflicts?.length) {
+        setFormError(buildConflictMessage(editCheck.conflicts));
+        setIsSaving(false);
+        return;
+      }
+      await requestJson(`${API_BASE}/schedule/${formEditId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
       });
-    }
-    await refreshAll();
-    setIsSaving(false);
+      await updateMatchingCourseDescriptions(payload, formEditId);
+      await updateMatchingCourseSectionHours(payload, formEditId);
+      if (
+        previousEntry &&
+        (normalizeMatchValue(previousEntry.Section) !== normalizeMatchValue(payload.Section) ||
+          normalizeMatchValue(previousEntry["Course Code"]) !==
+            normalizeMatchValue(payload["Course Code"]))
+      ) {
+        await updateCourseSectionHoursAfterRemoval(previousEntry);
+      }
+      setFormEditId(null);
+      setToast({ message: formEditId ? "Class updated" : "Class added", showRevert: false });
+      if (previousEntry) {
+        pushUndoAction({
+          type: "edit",
+          entry: previousEntry,
+          label: `Edit Class: ${previousEntry["Course Code"]}`,
+        });
+      }
+      await refreshAll();
+      setEditorOpen(false);
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : "Could not save class.");
+    } finally { setIsSaving(false); }
   };
 
   const deleteEntry = async (entry: ScheduleEntry) => {
-    if (readOnly) return;
+    if (!canEditEntry(entry)) return;
     pinVersion("schedule", entry.id, entry.version);
     if (isSaving) return;
     const confirmed = window.confirm("Delete this class?");
@@ -2340,16 +2347,28 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     element.classList.add("export-mode");
     const previousHeight = element.style.height;
     const previousOverflow = element.style.overflow;
+    const previousWidth = element.style.width;
+    const previousTop = element.scrollTop;
+    const previousLeft = element.scrollLeft;
     element.style.height = `${element.scrollHeight}px`;
+    element.style.width = `${element.scrollWidth}px`;
     element.style.overflow = "visible";
-    const canvas = await html2canvas(element, {
+    element.scrollTop = 0;
+    element.scrollLeft = 0;
+    try {
+      const canvas = await html2canvas(element, {
       backgroundColor: "#ffffff",
       scale: 2,
-    });
-    element.style.height = previousHeight;
-    element.style.overflow = previousOverflow;
-    element.classList.remove("export-mode");
-    return canvas.toDataURL("image/png");
+      });
+      return canvas.toDataURL("image/png");
+    } finally {
+      element.style.height = previousHeight;
+      element.style.width = previousWidth;
+      element.style.overflow = previousOverflow;
+      element.classList.remove("export-mode");
+      element.scrollTop = previousTop;
+      element.scrollLeft = previousLeft;
+    }
   };
 
   const exportTimetablePng = async (
@@ -2358,24 +2377,27 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     force = false
   ) => {
     const selectionName = selectionOverride ?? currentViewConfig.selected;
-    if (!timetableRef.current || !selectionName) return;
+    const captureElement = force ? captureTimetableRef.current : timetableRef.current;
+    if (!captureElement || !selectionName) return;
     if (isExporting && !force) return;
     if (!force) {
       setIsExporting(true);
     }
-    const dataUrl = await captureElementToPng(timetableRef.current);
-    const link = document.createElement("a");
-    const modeLabel = (modeOverride ?? viewMode).split("-")[1] ?? "timetable";
-    const safeName = selectionName
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "_")
-      .replace(/(^_|_$)/g, "");
-    link.download = `timetable_${modeLabel}_${safeName || "export"}.png`;
-    link.href = dataUrl;
-    link.click();
-    if (!force) {
-      setIsExporting(false);
-    }
+    try {
+      const dataUrl = await captureElementToPng(captureElement);
+      const link = document.createElement("a");
+      const modeLabel = (modeOverride ?? viewMode).split("-")[1] ?? "timetable";
+      const safeName = selectionName
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/(^_|_$)/g, "");
+      link.download = `timetable_${modeLabel}_${safeName || "export"}.png`;
+      link.href = dataUrl;
+      link.click();
+    } catch (error) {
+      if (force) throw error;
+      setToast({ message: error instanceof Error ? error.message : "Export failed", showRevert: false });
+    } finally { if (!force) setIsExporting(false); }
   };
 
   const exportDelayMs = 150;
@@ -2388,15 +2410,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     total: number
   ) => {
     if (exportCancelRef.current) return;
-    if (mode === "timetable-section") {
-      setSelectedSection(selectionName);
-    } else if (mode === "timetable-faculty") {
-      setSelectedFaculty(selectionName);
-    } else if (mode === "timetable-room") {
-      setSelectedRoom(selectionName);
-    }
-    setViewMode(mode);
-    await fetchTimetableForSelection(selectionName, mode);
+    setCapturePane({ ...activePane, mode: mode as TimetableMode, [paneField(mode as TimetableMode)]: selectionName, zoom: 100, scrollTop: 0, scrollLeft: 0 });
     setExportProgress({ current, total, label: progressLabel, running: true });
     await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
     await new Promise((resolve) => setTimeout(resolve, exportDelayMs));
@@ -2426,28 +2440,24 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     exportCancelRef.current = false;
     setExportCancelRequested(false);
     setIsExporting(true);
-    const previousMode = viewMode;
-    const previousSelection = currentViewConfig.selected;
-    for (let index = 0; index < queue.length; index += 1) {
-      if (exportCancelRef.current) break;
-      const item = queue[index];
-      const sanitized = sanitizeFilename(item.name);
-      if (!sanitized) continue;
-      await exportTimetablePngFor(item.name, item.mode, item.label, index + 1, total);
-      if (exportCancelRef.current) break;
-      await new Promise((resolve) => setTimeout(resolve, exportDelayMs));
+    try {
+      for (let index = 0; index < queue.length; index += 1) {
+        if (exportCancelRef.current) break;
+        const item = queue[index];
+        const sanitized = sanitizeFilename(item.name);
+        if (!sanitized) continue;
+        await exportTimetablePngFor(item.name, item.mode, item.label, index + 1, total);
+        if (exportCancelRef.current) break;
+        await new Promise((resolve) => setTimeout(resolve, exportDelayMs));
+      }
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : "Export failed", showRevert: false });
+    } finally {
+      setCapturePane(null);
+      setExportProgress(null);
+      setIsExporting(false);
+      setExportCancelRequested(false);
     }
-    setViewMode(previousMode);
-    if (previousMode === "timetable-section") {
-      setSelectedSection(previousSelection);
-    } else if (previousMode === "timetable-faculty") {
-      setSelectedFaculty(previousSelection);
-    } else if (previousMode === "timetable-room") {
-      setSelectedRoom(previousSelection);
-    }
-    setExportProgress(null);
-    setIsExporting(false);
-    setExportCancelRequested(false);
   };
 
   const ensureEntityExists = async (path: string, name: string, entities: NamedEntity[]) => {
@@ -2457,7 +2467,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       (entity) => entity.name.toLowerCase() === name.trim().toLowerCase()
     );
     if (exists) return;
-    await fetch(`${API_BASE}/${path}`, {
+    await requestJson(`${API_BASE}/${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: name.trim() }),
@@ -2465,6 +2475,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   };
 
   const handleCreateSchedule = async () => {
+    if (readOnly) return;
     if (isSaving) return;
     if (formEditId !== null) {
       await saveFormEdit();
@@ -2505,61 +2516,64 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     }
     setFormError("");
     setIsSaving(true);
-    await ensureEntityExists("sections", scheduleForm.Section, sections);
-    await ensureEntityExists("faculty", scheduleForm.Faculty, faculty);
-    await ensureEntityExists("rooms", scheduleForm.Room, rooms);
+    try {
+      await ensureEntityExists("sections", scheduleForm.Section, sections);
+      await ensureEntityExists("faculty", scheduleForm.Faculty, faculty);
+      await ensureEntityExists("rooms", scheduleForm.Room, rooms);
 
-    const payload = withCalculatedHours(
-      withCanonicalCourseDescription({
-        ...scheduleForm,
-        Days: normalizedDays,
-        "Time (LPU Std)": isTbaEntry ? "TBA" : scheduleForm["Time (LPU Std)"],
-        "Time (24 Hrs)": "",
-      }),
-      null
-    );
-    const createCheck = await checkMoveConflicts({ ...payload, id: 0 } as ScheduleEntry, payload);
-    if (!createCheck.ok && createCheck.reason === "conflict" && createCheck.conflicts?.length) {
-      setFormError(buildConflictMessage(createCheck.conflicts));
-      setIsSaving(false);
-      return;
-    }
-    const createResponse = await fetch(`${API_BASE}/schedule`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const created = await createResponse.json();
-    if (created?.id) {
-      await updateMatchingCourseDescriptions({ ...payload, id: created.id }, created.id);
-      await updateMatchingCourseSectionHours({ ...payload, id: created.id }, created.id);
-      pushUndoAction({
-        type: "add",
-        entryId: created.id,
-        label: `Add Class: ${payload["Course Code"]}`,
+      const payload = withCalculatedHours(
+        withCanonicalCourseDescription({
+          ...scheduleForm,
+          Days: normalizedDays,
+          "Time (LPU Std)": isTbaEntry ? "TBA" : scheduleForm["Time (LPU Std)"],
+          "Time (24 Hrs)": "",
+        }),
+        null
+      );
+      const createCheck = await checkMoveConflicts({ ...payload, id: 0 } as ScheduleEntry, payload);
+      if (!createCheck.ok && createCheck.reason === "conflict" && createCheck.conflicts?.length) {
+        setFormError(buildConflictMessage(createCheck.conflicts));
+        setIsSaving(false);
+        return;
+      }
+      const created = await requestJson(`${API_BASE}/schedule`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
       });
-    }
-    setScheduleForm((prev) => ({
-      ...prev,
-      "Course Code": "",
-      "Course Description": "",
-      Units: 0,
-      "# of Hours": 0,
-      "Time (LPU Std)": "",
-      "Time (24 Hrs)": "",
-      Days: "",
-      Room: "",
-      Faculty: "",
-    }));
-    setLastSelection(null);
-    setSelection(null);
-    setSelectionEnd(null);
-    setSelectionOrigin(null);
-    setMoveSnapshot(null);
-    setSelectedEntryId(null);
-    setToast({ message: "Class added", showRevert: false });
-    await refreshAll();
-    setIsSaving(false);
+      if (created?.id) {
+        await updateMatchingCourseDescriptions({ ...payload, id: created.id }, created.id);
+        await updateMatchingCourseSectionHours({ ...payload, id: created.id }, created.id);
+        pushUndoAction({
+          type: "add",
+          entryId: created.id,
+          label: `Add Class: ${payload["Course Code"]}`,
+        });
+      }
+      setScheduleForm((prev) => ({
+        ...prev,
+        "Course Code": "",
+        "Course Description": "",
+        Units: 0,
+        "# of Hours": 0,
+        "Time (LPU Std)": "",
+        "Time (24 Hrs)": "",
+        Days: "",
+        Room: "",
+        Faculty: "",
+      }));
+      setLastSelection(null);
+      setSelection(null);
+      setSelectionEnd(null);
+      setSelectionOrigin(null);
+      setMoveSnapshot(null);
+      setSelectedEntryId(null);
+      setToast({ message: "Class added", showRevert: false });
+      await refreshAll();
+      setEditorOpen(false);
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : "Could not save class.");
+    } finally { setIsSaving(false); }
   };
 
   const handleEdit = (entry: ScheduleEntry) => {
@@ -2670,24 +2684,6 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
         label: `Delete Class: ${entry["Course Code"]}`,
       });
     }
-    refreshAll();
-  };
-
-  const handleCreateNamed = async (
-    path: string,
-    value: string,
-    reset: () => void,
-    label: string
-  ) => {
-    const trimmed = value.trim();
-    if (!trimmed) return;
-    await fetch(`${API_BASE}/${path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: trimmed }),
-    });
-    reset();
-    setToast({ message: `${label} added`, showRevert: false });
     refreshAll();
   };
 
@@ -2872,6 +2868,10 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     nextName: string
   ) => {
     const oldKey = normalizeMatchValue(oldName);
+    setPaneSettings(prev => ({ ...prev,
+      left: { ...prev.left, [kind]: normalizeMatchValue(prev.left[kind]) === oldKey ? nextName : prev.left[kind] },
+      right: { ...prev.right, [kind]: normalizeMatchValue(prev.right[kind]) === oldKey ? nextName : prev.right[kind] },
+    }));
     const nextKey = normalizeMatchValue(nextName);
     if (kind === "section") {
       setSectionCurriculumIds(prev => {
@@ -2930,6 +2930,10 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
 
   const applyEntityRemovalLocally = (kind: EntityEditorKind, name: string) => {
     const key = normalizeMatchValue(name);
+    setPaneSettings(prev => ({ ...prev,
+      left: { ...prev.left, [kind]: normalizeMatchValue(prev.left[kind]) === key ? "" : prev.left[kind] },
+      right: { ...prev.right, [kind]: normalizeMatchValue(prev.right[kind]) === key ? "" : prev.right[kind] },
+    }));
     if (kind === "section") {
       setSectionCurriculumIds(prev => { const next = { ...prev }; delete next[key]; return next; });
       setSectionYearLevels((prev) => {
@@ -3235,10 +3239,6 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     return sorted;
   }, [entries, filterText, sortKey, sortDirection]);
 
-  const timetableGroup = viewMode.startsWith("timetable")
-    ? viewMode.split("-")[1]
-    : "section";
-
   const isTimetableView = viewMode.startsWith("timetable");
   const effectiveSelection =
     currentViewConfig.selected || currentViewConfig.entities[0]?.name || "";
@@ -3249,10 +3249,6 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
         (sections.length === 0 || (isTimetableView && currentViewConfig.entities.length === 0));
   const canExportTimetable =
     isTimetableView && Boolean(effectiveSelection) && currentViewConfig.entities.length > 0;
-  const currentSectionBg =
-    viewMode === "timetable-section"
-      ? customizeSettings.sectionBgColors[effectiveSelection]
-      : undefined;
   const facultyLoadHours = useMemo(() => {
     const loads: Record<string, number> = {};
     entries.forEach((entry) => {
@@ -3266,21 +3262,16 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     const rounded = roundHours(hours);
     return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
   };
-  const getTimetableEntityLabel = (name: string) => {
-    if (viewMode !== "timetable-faculty" || !name) {
-      return name;
-    }
-    const hours = facultyLoadHours[normalizeMatchValue(name)] ?? 0;
-    return `${name} (${formatHoursLabel(hours)} hrs)`;
-  };
   const facultyPickerValue = normalizeHex(facultyColorInput) || colorPalette[0];
   const sectionPickerValue = normalizeHex(sectionColorInput) || colorPalette[0];
 
   const conflictDetails = useMemo(() => {
-    const entryMap = new Map(entries.map((entry) => [entry.id, entry]));
+    const entryMap = new Map(sharedEntries.map((entry) => [entry.id, entry]));
+    const programIds = new Set(entries.map(entry => entry.id));
+    const visibleRooms = (wideSplit ? [paneSettings.left, paneSettings.right] : [activePane]).filter(pane => pane.mode === "timetable-room").map(pane => pane.room);
     return conflicts.conflicts.flatMap((conflict) => {
       const entry = entryMap.get(conflict.entry_id);
-      if (!entry) return [];
+      if (!entry || (!programIds.has(entry.id) && !visibleRooms.includes(entry.Room))) return [];
       return conflict.conflicts_with.map((otherId) => {
         const other = entryMap.get(otherId);
         if (!other) return null;
@@ -3309,43 +3300,626 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
         };
       });
     }).filter(Boolean);
-  }, [conflicts, entries]);
+  }, [conflicts, entries, sharedEntries, paneSettings, wideSplit]);
 
   const zoomStep = 5;
   const zoomMin = 75;
   const zoomMax = 130;
-  const applyZoom = (next: number) => {
-    const clamped = Math.min(zoomMax, Math.max(zoomMin, next));
-    setZoomPercent(clamped);
-    localStorage.setItem("timetableZoom", String(clamped));
+  const openAddClass = (id: PaneId) => {
+    if (readOnly || isSaving) return;
+    activatePane(id);
+    const pane = paneSettings[id];
+    const assignment = assignmentForPane(pane);
+    const defaults = { ...buildEmptyScheduleForm({ Program: scheduleForm.Program }),
+      [assignment.kind === "section" ? "Section" : assignment.kind === "faculty" ? "Faculty" : "Room"]: assignment.name };
+    if (selectionPaneId === id && selectionRange) {
+      defaults.Days = selectionRange.day;
+      defaults["Time (LPU Std)"] = toLpuLabel(selectionRange.startMinutes, selectionRange.endMinutes);
+      defaults["Time (24 Hrs)"] = toTimeRange24(selectionRange.startMinutes, selectionRange.endMinutes);
+    }
+    setFormEditId(null); setFormError(""); setSelectedEntryId(null); setScheduleForm(defaults);
+    editorBaseline.current = draftFingerprint(defaults); setEditorOpen(true);
   };
-
-  const rowHeight = `${40 * (zoomPercent / 100)}px`;
-  const fontSize = `${12 * (zoomPercent / 100)}px`;
-  const blockPadding = `${6 * (zoomPercent / 100)}px`;
-  const blockFontSize = `${customizeSettings.classBlockFontSizePx * (zoomPercent / 100)}px`;
-
-  const currentIndex = useMemo(
-    () =>
-      currentViewConfig.entities.findIndex((entity) => entity.name === effectiveSelection),
-    [currentViewConfig, effectiveSelection]
-  );
-  const hasMultipleEntities = currentViewConfig.entities.length > 1;
-
-  const handlePrevEntity = () => {
-    if (!hasMultipleEntities) return;
-    const nextIndex =
-      currentIndex <= 0 ? currentViewConfig.entities.length - 1 : currentIndex - 1;
-    currentViewConfig.setSelected(currentViewConfig.entities[nextIndex].name);
+  const resizeDivider = (clientX: number) => {
+    const bounds = splitContainerRef.current?.getBoundingClientRect();
+    if (!bounds || bounds.width < 848) return;
+    const width = bounds.width - 8;
+    const ratio = Math.max(420 / width, Math.min(1 - 420 / width, (clientX - bounds.left) / width));
+    setPaneSettings(prev => ({ ...prev, ratio }));
   };
-
-  const handleNextEntity = () => {
-    if (!hasMultipleEntities) return;
-    const nextIndex =
-      currentIndex >= currentViewConfig.entities.length - 1 ? 0 : currentIndex + 1;
-    currentViewConfig.setSelected(currentViewConfig.entities[nextIndex].name);
+  const handlePaneScroll = (id: PaneId, element: HTMLDivElement) => {
+    const otherId = id === "left" ? "right" : "left";
+    const other = (otherId === "left" ? leftTimetableRef : rightTimetableRef).current;
+    const grid = element.querySelector<HTMLElement>(".timetable-grid");
+    const gridOffset = grid ? grid.offsetTop : 0;
+    const top = element.scrollTop;
+    if (scrollSyncRef.current === id) {
+      scrollSyncRef.current = null;
+      updatePane(id, { scrollTop: top, scrollLeft: element.scrollLeft });
+      return;
+    }
+    updatePane(id, { scrollTop: top, scrollLeft: element.scrollLeft });
+    if (!wideSplit || !paneSettings.linked || !other || isExporting) return;
+    const otherGrid = other.querySelector<HTMLElement>(".timetable-grid");
+    const otherOffset = otherGrid ? otherGrid.offsetTop : 0;
+    const target = Math.max(0, otherOffset + linkedScrollTop(top - gridOffset, paneSettings[id].zoom, paneSettings[otherId].zoom));
+    if (Math.abs(other.scrollTop - target) > 1) {
+      scrollSyncRef.current = otherId;
+      other.scrollTop = target;
+    }
   };
+  const applyPaneZoom = (id: PaneId, next: number) => {
+    const zoom = Math.max(zoomMin, Math.min(zoomMax, next));
+    const element = (id === "left" ? leftTimetableRef : rightTimetableRef).current;
+    const grid = element?.querySelector<HTMLElement>(".timetable-grid");
+    const offset = grid ? grid.offsetTop : 0;
+    const scrollTop = Math.max(0, offset + linkedScrollTop((element?.scrollTop ?? 0) - offset, paneSettings[id].zoom, zoom));
+    updatePane(id, { zoom, scrollTop });
+    requestAnimationFrame(() => { if (element) element.scrollTop = scrollTop; });
+  };
+  const renderTimetable = (id: PaneId, exportPane?: PaneState) => {
+    const capture = Boolean(exportPane);
+    const pane = exportPane ?? paneSettings[id];
+    const viewMode = pane.mode;
+    const kind = paneField(viewMode);
+    const entities = kind === "section" ? sectionOptions : kind === "faculty" ? facultyOptions : roomOptions;
+    const effectiveSelection = pane[kind] || entities[0]?.name || "";
+    const currentViewConfig = { selected: effectiveSelection, entities, label: kind, setSelected: (name: string) => { activatePane(id); updatePane(id, { [kind]: name }); } };
+    const currentSectionBg = kind === "section" ? customizeSettings.sectionBgColors[effectiveSelection] : undefined;
+    const field = kind === "section" ? "Section" : kind === "faculty" ? "Faculty" : "Room";
+    const timetableEntries = (kind === "room" ? sharedEntries : entries).filter(entry => entry[field] === effectiveSelection);
+    const paneSelectionRange = !capture && selectionPaneId === id ? selectionRange : null;
+    const zoomPercent = pane.zoom;
+    const rowHeight = `${40 * zoomPercent / 100}px`;
+    const fontSize = `${12 * zoomPercent / 100}px`;
+    const blockPadding = `${6 * zoomPercent / 100}px`;
+    const blockFontSize = `${customizeSettings.classBlockFontSizePx * zoomPercent / 100}px`;
+    const hasMultipleEntities = entities.length > 1;
+    const index = entities.findIndex(entity => entity.name === effectiveSelection);
+    const prevEntity = () => currentViewConfig.setSelected(entities[(index - 1 + entities.length) % entities.length].name);
+    const nextEntity = () => currentViewConfig.setSelected(entities[(index + 1) % entities.length].name);
+    const getTimetableEntityLabel = (name: string) => kind === "faculty" && name ? `${name} (${formatHoursLabel(facultyLoadHours[normalizeMatchValue(name)] ?? 0)} hrs)` : name;
+    const scrollRef = capture ? captureTimetableRef : id === "left" ? leftTimetableRef : rightTimetableRef;
+    return (
+    <TimetablePane key={capture ? "capture" : id} id={id} pane={pane} split={splitMode} active={!capture && activePaneId === id} capture={capture} ready={entities.length > 0}
+      scrollRef={scrollRef} onActivate={() => { if (!capture) activatePane(id); }}
+      onMode={mode => updatePane(id, { mode })} canAdd={!readOnly} onAdd={() => openAddClass(id)}
+      onScroll={event => { if (!capture) handlePaneScroll(id, event.currentTarget); }}
+      onContextMenu={event => { if (!capture) handleContextMenu(event, id); }}
+      onMouseUp={() => { if (selectionPaneId === id) finalizeSelection(); }} background={currentSectionBg}>
+              <div className="timetable-header">
+                <div className="timetable-header-left">
+                  <button
+                    className="nav-button"
+                    onClick={prevEntity}
+                    disabled={!hasMultipleEntities}
+                  >
+                    ◀
+                  </button>
+                  <select
+                    value={effectiveSelection}
+                    onChange={(event) => currentViewConfig.setSelected(event.target.value)}
+                    disabled={currentViewConfig.entities.length === 0}
+                  >
+                    {currentViewConfig.entities.map((entity) => (
+                      <option key={entity.id} value={entity.name}>
+                        {getTimetableEntityLabel(entity.name)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="timetable-title">
+                  {getTimetableEntityLabel(effectiveSelection) ||
+                    (currentViewConfig.label ? `No ${currentViewConfig.label} yet` : "")}
+                </div>
+                <div className="timetable-header-right">
+                  <div className="zoom-controls">
+                    <button
+                      className="nav-button"
+                      onClick={() => applyPaneZoom(id, zoomPercent - zoomStep)}
+                      disabled={zoomPercent <= zoomMin}
+                    >
+                      -
+                    </button>
+                    <button className="nav-button" onClick={() => applyPaneZoom(id, 100)}>
+                      Reset
+                    </button>
+                    <button
+                      className="nav-button"
+                      onClick={() => applyPaneZoom(id, zoomPercent + zoomStep)}
+                      disabled={zoomPercent >= zoomMax}
+                    >
+                      +
+                    </button>
+                  </div>
+                  <button
+                    className="nav-button"
+                    onClick={nextEntity}
+                    disabled={!hasMultipleEntities}
+                  >
+                    ▶
+                  </button>
+                </div>
+              </div>
+              {!capture && activePaneId === id && toast && toast.showRevert && (
+                <div className="toast overlay">
+                  <span>{toast.message}</span>
+                  {toast.showRevert && moveSnapshot && (
+                    <button className="nav-button" onClick={handleRevertMove}>
+                      Revert
+                    </button>
+                  )}
+                </div>
+              )}
+              {currentViewConfig.entities.length === 0 ? (
+                <p className="timetable-empty">No {currentViewConfig.label} yet.</p>
+              ) : (
+                <>
+                  <div
+                    className="day-headers"
+                    style={{
+                      gridTemplateColumns: `${splitMode && !capture ? 72 : 120}px repeat(${visibleDays.length}, minmax(90px, 1fr))`,
+                    }}
+                  >
+                    <div className="time-header">Time</div>
+                    {visibleDays.map((day) => (
+                      <div key={day} className="day-header">
+                        {dayLabels[day]}
+                      </div>
+                    ))}
+                  </div>
+                  <div
+                    className="timetable-grid"
+                    onDragOver={(event) => event.preventDefault()}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      handleDrop(id);
+                    }}
+                    style={{
+                      gridTemplateColumns: `${splitMode && !capture ? 72 : 120}px repeat(${visibleDays.length}, minmax(90px, 1fr))`,
+                      gridTemplateRows: `repeat(${slots.length}, var(--row-height))`,
+                      ["--row-height" as string]: rowHeight,
+                      ["--font-size" as string]: fontSize,
+                      ["--block-font-size" as string]: blockFontSize,
+                      ["--block-padding" as string]: blockPadding,
+                    }}
+                  >
+                    {slots.map((slot, rowIndex) => (
+                      <div
+                        key={`time-${slot}`}
+                        className="time-cell"
+                        style={{ gridRow: rowIndex + 1 }}
+                      >
+                        {toLpuLabel(slot, slot + interval)}
+                      </div>
+                    ))}
+                    {visibleDays.map((day, dayIndex) =>
+                      slots.map((slot, rowIndex) => (
+                        <div
+                          key={`${day}-${slot}`}
+                          className={`cell ${
+                            paneSelectionRange &&
+                            paneSelectionRange.day === day &&
+                            slot >= paneSelectionRange.startMinutes &&
+                            slot < paneSelectionRange.endMinutes
+                              ? "selected"
+                              : ""
+                          }`}
+                          style={{ gridColumn: dayIndex + 2, gridRow: rowIndex + 1 }}
+                          onMouseDown={(event) => handleSelectStart(event, day, rowIndex, id)}
+                          onMouseEnter={() => { if (selectionPaneId === id) handleSelectMove(day, rowIndex); }}
+                          onMouseUp={() => { if (selectionPaneId === id) finalizeSelection(); }}
+                          onDragOver={(event) => handleDragOver(event, day, slot, id)}
+                          data-day={day}
+                          data-slot={slot}
+                        />
+                      ))
+                    )}
+                    {timetableEntries.flatMap((entry) => {
+                      const days = normalizeDays(entry.Days).split(",").filter(Boolean);
+                      const parsedTime = parseTimeRange(entry["Time (24 Hrs)"]);
+                      if (!parsedTime || days.length === 0) return [];
+                      const { start, end } = parsedTime;
+                      const startIndex = Math.max(
+                        0,
+                        slots.findIndex((slot) => slot >= start)
+                      );
+                      const foundEndIndex = slots.findIndex((slot) => slot >= end);
+                      const endIndex = Math.max(startIndex + 1, foundEndIndex < 0 ? slots.length : foundEndIndex);
+                      return days
+                        .filter((day) => visibleDays.includes(day))
+                        .map((day) => {
+                          const column = visibleDays.indexOf(day) + 2;
+                          const blockBg =
+                            !conflictSet.has(entry.id) &&
+                            customizeSettings.blockDisplay.useFacultyColors &&
+                            customizeSettings.facultyColors[entry.Faculty]
+                              ? customizeSettings.facultyColors[entry.Faculty]
+                              : undefined;
+                          const textColor = blockBg ? getReadableTextColor(blockBg) : undefined;
+                          return (
+                            <div
+                              key={`${entry.id}-${day}`}
+                              className={`block ${conflictSet.has(entry.id) ? "conflict" : ""} ${
+                                !capture && selectedEntryId === entry.id ? "selected" : ""
+                              }`}
+                              style={{
+                                gridColumn: column,
+                                gridRow: `${startIndex + 1} / ${Math.max(endIndex, startIndex + 1) + 1}`,
+                                backgroundColor: blockBg,
+                                color: textColor,
+                              }}
+                              draggable={!capture && canEditEntry(entry) && !isSaving && !editorOpen && !isExporting}
+                              tabIndex={capture ? undefined : 0}
+                              role="button"
+                              data-entry-id={entry.id}
+                              aria-label={`${canEditEntry(entry) ? "Edit" : "View"} ${entry["Course Code"]}, ${entry.Section}, ${day}`}
+                              onKeyDown={event => { if (!capture && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); setSelectedEntryId(entry.id); enterEditMode(entry); } }}
+                              onDragStart={() => handleDragStart(entry, day, id)}
+                              onDragOver={event => {
+                                const offset = event.clientY - event.currentTarget.getBoundingClientRect().top;
+                                const row = Math.floor(offset / (40 * pane.zoom / 100));
+                                handleDragOver(event, day, slots[startIndex] + row * interval, id);
+                              }}
+                              onDragEnd={() => {
+                                setDragging(null);
+                                setDragTarget(null);
+                              }}
+                              onClick={() => { if (!capture) { setSelectedEntryId(entry.id); enterEditMode(entry); } }}
+                              onContextMenu={(event) => handleBlockContextMenu(event, entry, day, id)}
+                            >
+                              <div className="block-content">
+                                {customizeSettings.blockDisplay.showCourseCode && (
+                                  <div className="block-title">{entry["Course Code"]}</div>
+                                )}
+                                {viewMode !== "timetable-section" && <div>{entry.Section}</div>}
+                                {customizeSettings.blockDisplay.showFaculty &&
+                                  viewMode !== "timetable-faculty" && <div>{entry.Faculty}</div>}
+                                {customizeSettings.blockDisplay.showRoom &&
+                                  viewMode !== "timetable-room" && <div>{entry.Room}</div>}
+                              </div>
+                            </div>
+                          );
+                        });
+                    })}
+                    {!capture && dragging && dragTarget && dragTarget.paneId === id && (
+                      <div
+                        className="block preview"
+                        style={{
+                          gridColumn: visibleDays.indexOf(dragTarget.day) + 2,
+                          gridRow: `${Math.max(
+                            1,
+                            slots.findIndex((slot) => slot >= dragTarget.startMinutes) + 1
+                          )} / ${Math.max(
+                            1,
+                            slots.findIndex((slot) => slot >= dragTarget.startMinutes) +
+                              Math.ceil(dragging.duration / interval) +
+                              1
+                          )}`,
+                        }}
+                      >
+                        <div className="block-title">{dragging.entry["Course Code"]}</div>
+                        <div>{assignmentForPane(pane).name}</div>
+                        <div>{dayLabels[dragTarget.day]} {toLpuLabel(dragTarget.startMinutes, dragTarget.startMinutes + dragging.duration)}</div>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+              {!capture && contextMenu && contextMenu.paneId === id && (
+                <div
+                  className="context-menu"
+                  style={{ top: contextMenu.y, left: contextMenu.x }}
+                >
+                  <button onClick={applySelectionToForm}>Add Class</button>
+                  {viewMode === "timetable-section" && copiedBlock ? (
+                    <button onClick={pasteCopiedBlockToCurrentSection} disabled={isSaving}>
+                      Paste Copied Class
+                    </button>
+                  ) : null}
+                </div>
+              )}
+              {!capture && blockMenu && blockMenu.paneId === id && (
+                <div
+                  className="block-menu"
+                  style={{ top: blockMenu.y, left: blockMenu.x }}
+                >
+                  <button onClick={() => enterEditMode(blockMenu.entry)} disabled={isSaving || !canEditEntry(blockMenu.entry)}>
+                    Edit
+                  </button>
+                  <button onClick={copyBlock} disabled={isSaving}>
+                    Copy
+                  </button>
+                  <button
+                    onClick={() => duplicateEntryToNextDay(blockMenu.entry, blockMenu.day)}
+                    disabled={isSaving || !canEditEntry(blockMenu.entry)}
+                  >
+                    Duplicate to Next Day
+                  </button>
+                  <button onClick={() => deleteEntry(blockMenu.entry)} disabled={isSaving || !canEditEntry(blockMenu.entry)}>
+                    Delete
+                  </button>
+                </div>
+              )}
+    </TimetablePane>
+    );
+  };
+  const renderClassForm = () => <>
+<fieldset disabled={readOnly} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
+          {!splitMode && formEditId && (
+            <div className="edit-mode-banner">
+              <div>
+                <strong>Editing selected class</strong>
+                <span>
+                  {scheduleForm["Course Code"] || "Untitled class"} /{" "}
+                  {scheduleForm.Section || "No section"}
+                </span>
+              </div>
+              <button
+                className="secondary-button compact-button"
+                onClick={cancelEditMode}
+                disabled={isSaving}
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+          {!splitMode && <h3>{formEditId ? "Edit Class" : "Add Class"}</h3>}
+          {activeCurriculumCourses.length > 0 ? (
+            <div className="form-note">
+              Curriculum: {curriculumTerm}
+              {formSectionYearLevel ? ` / ${formSectionYearLevel}` : ""}
+              {formSectionYearLevel && getYearLevelCurriculum(formSectionYearLevel)
+                ? ` / ${getYearLevelCurriculum(formSectionYearLevel)?.name}`
+                : ""} (
+              {getCurriculumCoursesForSection(scheduleForm.Section).length} courses)
+            </div>
+          ) : null}
+          <label>
+            Program
+            <input
+              value={scheduleForm.Program}
+              readOnly
+              onChange={(event) => {
+                const value = event.target.value;
+                setScheduleForm({ ...scheduleForm, Program: value });
+                localStorage.setItem("lastProgram", value);
+              }}
+            />
+          </label>
+          <label>
+            Section
+            <input
+              value={scheduleForm.Section}
+              onChange={(event) => {
+                const value = event.target.value;
+                setScheduleForm({ ...scheduleForm, Section: value });
+                localStorage.setItem("lastSection", value);
+              }}
+              list="section-list"
+            />
+            <datalist id="section-list">
+              {sections.map((section) => (
+                <option key={section.id} value={section.name} />
+              ))}
+            </datalist>
+          </label>
+          <label className="course-code-field">
+            Course Code
+            <input
+              ref={courseCodeRef}
+              aria-label="Course Code"
+              className={selectedCoursePlotStatus.isOverPlotted ? "course-code-over-plotted" : selectedCoursePlotStatus.isComplete ? "course-code-complete" : ""}
+              value={scheduleForm["Course Code"]}
+              onChange={(event) => {
+                applyCourseCodeToScheduleForm(event.target.value);
+                openCourseCodeMenu();
+              }}
+              onFocus={openCourseCodeMenu}
+              onClick={openCourseCodeMenu}
+              onBlur={() => window.setTimeout(() => setIsCourseCodeMenuOpen(false), 120)}
+              autoComplete="off"
+            />
+            {scheduleForm["Course Code"] ? (
+              <div
+                className={`course-plot-status ${
+                  selectedCoursePlotStatus.isOverPlotted ? "over-plotted" : selectedCoursePlotStatus.isComplete ? "complete" : ""
+                }`}
+              >
+                {selectedCoursePlotStatus.requiredHours !== null
+                  ? `${formatHoursLabel(selectedCoursePlotStatus.plottedHours)} / ${formatHoursLabel(
+                      selectedCoursePlotStatus.requiredHours
+                    )} hrs plotted`
+                  : `${formatHoursLabel(selectedCoursePlotStatus.plottedHours)} hrs plotted`}
+                {selectedCoursePlotStatus.isOverPlotted ? " — Over-plotted: exceeds curriculum hours" : ""}
+              </div>
+            ) : null}
+            {isCourseCodeMenuOpen && visibleCourseCodeOptions.length > 0 ? (
+              <div className="course-code-menu-left" style={courseCodeMenuPosition}>
+                {visibleCourseCodeOptions.map((courseCode) => {
+                  const status = getCoursePlotStatus(courseCode, scheduleForm.Section, null);
+                  return (
+                    <button
+                      key={courseCode}
+                      type="button"
+                      className={status.isOverPlotted ? "over-plotted" : status.isComplete ? "complete" : ""}
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        applyCourseCodeToScheduleForm(courseCode);
+                        setIsCourseCodeMenuOpen(false);
+                      }}
+                    >
+                      <span>{courseCode}</span>
+                      <span>{getCourseCodeOptionLabel(courseCode)}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
+            <datalist id="course-code-list">
+              {formCourseCodeOptions.map((courseCode) => (
+                <option
+                  key={courseCode}
+                  value={courseCode}
+                  label={getCourseCodeOptionLabel(courseCode)}
+                />
+              ))}
+            </datalist>
+          </label>
+          <label>
+            Course Description
+            <input
+              value={scheduleForm["Course Description"]}
+              readOnly={Boolean(getCanonicalCourseDescription(scheduleForm["Course Code"]))}
+              onChange={(event) => {
+                const canonical = getCanonicalCourseDescription(scheduleForm["Course Code"]);
+                setScheduleForm({
+                  ...scheduleForm,
+                  "Course Description": canonical || event.target.value,
+                });
+              }}
+            />
+          </label>
+          <label>
+            Units
+            <input
+              type="number"
+              value={scheduleForm.Units}
+              onChange={(event) =>
+                setScheduleForm({
+                  ...scheduleForm,
+                  Units: Number(event.target.value),
+                })
+              }
+            />
+          </label>
+          <label>
+            # of Hours
+            <input
+              type="number"
+              value={scheduleForm["# of Hours"]}
+              readOnly
+            />
+          </label>
+          <label>
+            Time (LPU Std)
+            <input
+              value={scheduleForm["Time (LPU Std)"]}
+              onChange={(event) => {
+                const value = event.target.value;
+                const parsed = parseLpuRange(value);
+                const isTbaValue = value.trim().toLowerCase() === "tba" || value.trim() === "";
+                setScheduleForm((prev) => ({
+                  ...prev,
+                  "Time (LPU Std)": value,
+                  "Time (24 Hrs)": parsed ? parsed.time24 : isTbaValue ? "" : prev["Time (24 Hrs)"],
+                }));
+                if (value && !parsed && !isTbaValue) {
+                  setFormError("Invalid Time (LPU Std). Example: 10:00a-12:00p");
+                } else {
+                  setFormError("");
+                }
+              }}
+            />
+          </label>
+          <label>
+            Time (24 Hrs)
+            <input
+              value={scheduleForm["Time (24 Hrs)"] ?? ""}
+              readOnly
+            />
+          </label>
+          <label>
+            Days
+            <input
+              value={scheduleForm.Days}
+              onChange={(event) =>
+                setScheduleForm({ ...scheduleForm, Days: event.target.value })
+              }
+              onBlur={(event) => {
+                const value = event.target.value;
+                const trimmed = value.trim();
+                setScheduleForm({
+                  ...scheduleForm,
+                  Days:
+                    trimmed.toLowerCase() === "tba" || trimmed === ""
+                      ? "TBA"
+                      : normalizeDays(value),
+                });
+              }}
+            />
+          </label>
+          <label>
+            Room
+            <input
+              value={scheduleForm.Room}
+              onChange={(event) =>
+                setScheduleForm({ ...scheduleForm, Room: event.target.value })
+              }
+              list="room-list"
+            />
+            <datalist id="room-list">
+              {rooms.map((room) => (
+                <option key={room.id} value={room.name} />
+              ))}
+            </datalist>
+          </label>
+          <label>
+            Faculty
+            <input
+              value={scheduleForm.Faculty}
+              onChange={(event) =>
+                setScheduleForm({ ...scheduleForm, Faculty: event.target.value })
+              }
+              list="faculty-list"
+            />
+            <datalist id="faculty-list">
+              {faculty.map((member) => (
+                <option key={member.id} value={member.name} />
+              ))}
+            </datalist>
+          </label>
+          {!splitMode && <button onClick={handleCreateSchedule} disabled={isSaving}>
+            {formEditId ? "Save Changes to Selected Class" : "Add Class"}
+          </button>}
+          {!splitMode && formEditId && (
+            <button className="secondary-button" onClick={cancelEditMode} disabled={isSaving}>
+              Cancel Edit
+            </button>
+          )}
+          {formError && <p className="error">{formError}</p>}
 
+          </fieldset>
+  </>;
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (editorOpen || isSaving || isExporting || target?.closest("input, textarea, select, [contenteditable=true]")) return;
+      if (!event.ctrlKey && !event.metaKey) return;
+      const key = event.key.toLowerCase();
+      if (key === "z" && !event.shiftKey) {
+        event.preventDefault(); void handleUndo();
+      } else if (key === "c") {
+        const id = Number(target?.closest<HTMLElement>("[data-entry-id]")?.dataset.entryId ?? selectedEntryId);
+        const entry = sharedEntries.find(row => row.id === id);
+        if (entry) {
+          event.preventDefault(); setCopiedBlock(entry);
+          setToast({ message: `Copied ${entry["Course Code"]} from ${entry.Section}`, showRevert: false });
+        }
+      } else if (key === "v" && copiedBlock && isTimetableView) {
+        event.preventDefault(); void pasteCopiedBlockToCurrentSection();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  });
+
+  useEffect(() => {
+    if (!wideSplit || !paneSettings.linked || !scheduleLoaded) return;
+    const element = timetableRef.current;
+    if (element) handlePaneScroll(activePaneId, element);
+  }, [wideSplit, paneSettings.linked, scheduleLoaded]);
 
   return (
     <div className={`app ${readOnly ? "online-readonly" : ""}`}>
@@ -3651,30 +4225,32 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
             </div>
           </div>
           <div className="view-buttons">
+            <button type="button" className={!splitMode ? "active" : ""} disabled={editorOpen || isSaving} onClick={() => setPaneSettings(prev => ({ ...prev, split: false }))}>Single View</button>
+            <button type="button" className={splitMode ? "active" : ""} disabled={editorOpen || isSaving} onClick={() => { setIsTextView(false); setPaneSettings(prev => ({ ...prev, split: true })); }}>Split View</button>
             <button
               className={viewMode === "text" ? "active" : ""}
-              onClick={() => setViewMode("text")}
+              disabled={editorOpen || isSaving} onClick={() => setViewMode("text")}
               type="button"
             >
               Text View
             </button>
             <button
               className={viewMode === "timetable-section" ? "active" : ""}
-              onClick={() => setViewMode("timetable-section")}
+              disabled={editorOpen || isSaving} onClick={() => setViewMode("timetable-section")}
               type="button"
             >
               Timetable: Per Section
             </button>
             <button
               className={viewMode === "timetable-faculty" ? "active" : ""}
-              onClick={() => setViewMode("timetable-faculty")}
+              disabled={editorOpen || isSaving} onClick={() => setViewMode("timetable-faculty")}
               type="button"
             >
               Timetable: Per Faculty
             </button>
             <button
               className={viewMode === "timetable-room" ? "active" : ""}
-              onClick={() => setViewMode("timetable-room")}
+              disabled={editorOpen || isSaving} onClick={() => setViewMode("timetable-room")}
               type="button"
             >
               Timetable: Per Room
@@ -4345,14 +4921,15 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
         </div>
       ) : null}
 
-      <div className="content">
-        <div className="main">
-          {showStartPage ? (
+      {capturePane && <div className="export-capture" aria-hidden="true">{renderTimetable("left", capturePane)}</div>}
+      <div className={`content ${splitMode ? "split-content" : ""}`}>
+        <div className="main" ref={mainRef}>
+          {showStartPage && !splitMode ? (
             <div className="start-page">
               <div className="start-page-copy">
                 <h2>{readOnly ? "No classes in this program yet" : "Start a timetable"}</h2>
                 <p>
-                  {readOnly ? "Choose another program to view its timetable." : "Import a program CSV, or create the first section and add classes from the panel on the right."}
+                  {readOnly ? "Choose another program to view its timetable." : "Import a program CSV, or create a section from Edit and use Add Class."}
                 </p>
               </div>
               <div className="start-actions">
@@ -4370,7 +4947,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                 </div>
                 <div>
                   <strong>2. Set up lists</strong>
-                  <span>Add sections, faculty, and rooms using the right-side form or Edit menu.</span>
+                  <span>Add sections, faculty, and rooms using the Edit menu.</span>
                 </div>
                 <div>
                   <strong>3. Add classes</strong>
@@ -4381,6 +4958,8 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
           ) : (
             <>
               <div className="controls">
+                {splitMode && <label className="link-scroll-control"><input type="checkbox" checked={paneSettings.linked} onChange={event => setPaneSettings(prev => ({ ...prev, linked: event.target.checked }))} />Link scrolling</label>}
+                {splitMode && !wideSplit && <div className="pane-tabs" aria-label="Visible schedule"><button className={activePaneId === "left" ? "active" : ""} onClick={() => activatePane("left")}>Left pane</button><button className={activePaneId === "right" ? "active" : ""} onClick={() => activatePane("right")}>Right pane</button></div>}
                 <label>
                   Show Sunday
                   <input
@@ -4524,561 +5103,34 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
               {editError && <p className="error">{editError}</p>}
             </div>
           ) : (
-            <div
-              className="timetable"
-              onContextMenu={handleContextMenu}
-              onMouseUp={finalizeSelection}
-              ref={timetableRef}
-              style={
-                currentSectionBg
-                  ? {
-                      backgroundColor: currentSectionBg,
-                    }
-                  : undefined
-              }
-            >
-              <div className="timetable-header">
-                <div className="timetable-header-left">
-                  <button
-                    className="nav-button"
-                    onClick={handlePrevEntity}
-                    disabled={!hasMultipleEntities}
-                  >
-                    ◀
-                  </button>
-                  <select
-                    value={effectiveSelection}
-                    onChange={(event) => currentViewConfig.setSelected(event.target.value)}
-                    disabled={currentViewConfig.entities.length === 0}
-                  >
-                    {currentViewConfig.entities.map((entity) => (
-                      <option key={entity.id} value={entity.name}>
-                        {getTimetableEntityLabel(entity.name)}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="timetable-title">
-                  {getTimetableEntityLabel(effectiveSelection) ||
-                    (currentViewConfig.label ? `No ${currentViewConfig.label} yet` : "")}
-                </div>
-                <div className="timetable-header-right">
-                  <div className="zoom-controls">
-                    <button
-                      className="nav-button"
-                      onClick={() => applyZoom(zoomPercent - zoomStep)}
-                      disabled={zoomPercent <= zoomMin}
-                    >
-                      -
-                    </button>
-                    <button className="nav-button" onClick={() => applyZoom(100)}>
-                      Reset
-                    </button>
-                    <button
-                      className="nav-button"
-                      onClick={() => applyZoom(zoomPercent + zoomStep)}
-                      disabled={zoomPercent >= zoomMax}
-                    >
-                      +
-                    </button>
-                  </div>
-                  <button
-                    className="nav-button"
-                    onClick={handleNextEntity}
-                    disabled={!hasMultipleEntities}
-                  >
-                    ▶
-                  </button>
-                </div>
-              </div>
-              {toast && toast.showRevert && (
-                <div className="toast overlay">
-                  <span>{toast.message}</span>
-                  {toast.showRevert && moveSnapshot && (
-                    <button className="nav-button" onClick={handleRevertMove}>
-                      Revert
-                    </button>
-                  )}
-                </div>
-              )}
-              {currentViewConfig.entities.length === 0 ? (
-                <p className="timetable-empty">No {currentViewConfig.label} yet.</p>
-              ) : (
-                <>
-                  <div
-                    className="day-headers"
-                    style={{
-                      gridTemplateColumns: `120px repeat(${visibleDays.length}, 1fr)`,
-                    }}
-                  >
-                    <div className="time-header">Time</div>
-                    {visibleDays.map((day) => (
-                      <div key={day} className="day-header">
-                        {dayLabels[day]}
-                      </div>
-                    ))}
-                  </div>
-                  <div
-                    className="timetable-grid"
-                    onDragOver={(event) => event.preventDefault()}
-                    onDrop={(event) => {
-                      event.preventDefault();
-                      handleDrop();
-                    }}
-                    style={{
-                      gridTemplateColumns: `120px repeat(${visibleDays.length}, 1fr)`,
-                      gridTemplateRows: `repeat(${slots.length}, var(--row-height))`,
-                      ["--row-height" as string]: rowHeight,
-                      ["--font-size" as string]: fontSize,
-                      ["--block-font-size" as string]: blockFontSize,
-                      ["--block-padding" as string]: blockPadding,
-                    }}
-                  >
-                    {slots.map((slot, rowIndex) => (
-                      <div
-                        key={`time-${slot}`}
-                        className="time-cell"
-                        style={{ gridRow: rowIndex + 1 }}
-                      >
-                        {toLpuLabel(slot, slot + interval)}
-                      </div>
-                    ))}
-                    {visibleDays.map((day, dayIndex) =>
-                      slots.map((slot, rowIndex) => (
-                        <div
-                          key={`${day}-${slot}`}
-                          className={`cell ${
-                            selectionRange &&
-                            selectionRange.day === day &&
-                            slot >= selectionRange.startMinutes &&
-                            slot < selectionRange.endMinutes
-                              ? "selected"
-                              : ""
-                          }`}
-                          style={{ gridColumn: dayIndex + 2, gridRow: rowIndex + 1 }}
-                          onMouseDown={(event) => handleSelectStart(event, day, rowIndex)}
-                          onMouseEnter={() => handleSelectMove(day, rowIndex)}
-                          onMouseUp={finalizeSelection}
-                          onDragOver={(event) => handleDragOver(event, day, slot)}
-                          data-day={day}
-                          data-slot={slot}
-                        />
-                      ))
-                    )}
-                    {timetableEntries.flatMap((entry) => {
-                      const days = normalizeDays(entry.Days).split(",").filter(Boolean);
-                      const parsedTime = parseTimeRange(entry["Time (24 Hrs)"]);
-                      if (!parsedTime || days.length === 0) return [];
-                      const { start, end } = parsedTime;
-                      const startIndex = Math.max(
-                        0,
-                        slots.findIndex((slot) => slot >= start)
-                      );
-                      const endIndex = Math.max(
-                        startIndex + 1,
-                        slots.findIndex((slot) => slot >= end)
-                      );
-                      return days
-                        .filter((day) => visibleDays.includes(day))
-                        .map((day) => {
-                          const column = visibleDays.indexOf(day) + 2;
-                          const blockBg =
-                            !conflictSet.has(entry.id) &&
-                            customizeSettings.blockDisplay.useFacultyColors &&
-                            customizeSettings.facultyColors[entry.Faculty]
-                              ? customizeSettings.facultyColors[entry.Faculty]
-                              : undefined;
-                          const textColor = blockBg ? getReadableTextColor(blockBg) : undefined;
-                          return (
-                            <div
-                              key={`${entry.id}-${day}`}
-                              className={`block ${conflictSet.has(entry.id) ? "conflict" : ""} ${
-                                selectedEntryId === entry.id ? "selected" : ""
-                              }`}
-                              style={{
-                                gridColumn: column,
-                                gridRow: `${startIndex + 1} / ${Math.max(endIndex, startIndex + 1) + 1}`,
-                                backgroundColor: blockBg,
-                                color: textColor,
-                              }}
-                              draggable
-                              onDragStart={() => handleDragStart(entry, day)}
-                              onDragEnd={() => {
-                                setDragging(null);
-                                setDragTarget(null);
-                              }}
-                              onClick={() => enterEditMode(entry)}
-                              onContextMenu={(event) => handleBlockContextMenu(event, entry, day)}
-                            >
-                              <div className="block-content">
-                                {customizeSettings.blockDisplay.showCourseCode && (
-                                  <div className="block-title">{entry["Course Code"]}</div>
-                                )}
-                                {viewMode !== "timetable-section" && <div>{entry.Section}</div>}
-                                {customizeSettings.blockDisplay.showFaculty &&
-                                  viewMode !== "timetable-faculty" && <div>{entry.Faculty}</div>}
-                                {customizeSettings.blockDisplay.showRoom &&
-                                  viewMode !== "timetable-room" && <div>{entry.Room}</div>}
-                              </div>
-                            </div>
-                          );
-                        });
-                    })}
-                    {dragging && dragTarget && (
-                      <div
-                        className="block preview"
-                        style={{
-                          gridColumn: visibleDays.indexOf(dragTarget.day) + 2,
-                          gridRow: `${Math.max(
-                            1,
-                            slots.findIndex((slot) => slot >= dragTarget.startMinutes) + 1
-                          )} / ${Math.max(
-                            1,
-                            slots.findIndex((slot) => slot >= dragTarget.startMinutes) +
-                              Math.ceil(dragging.duration / interval) +
-                              1
-                          )}`,
-                        }}
-                      >
-                        <div className="block-title">{dragging.entry["Course Code"]}</div>
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
-              {contextMenu && (
-                <div
-                  className="context-menu"
-                  style={{ top: contextMenu.y, left: contextMenu.x }}
-                >
-                  <button onClick={applySelectionToForm}>Add Class</button>
-                  {viewMode === "timetable-section" && copiedBlock ? (
-                    <button onClick={pasteCopiedBlockToCurrentSection} disabled={readOnly || isSaving}>
-                      Paste Copied Class
-                    </button>
-                  ) : null}
-                </div>
-              )}
-              {blockMenu && (
-                <div
-                  className="block-menu"
-                  style={{ top: blockMenu.y, left: blockMenu.x }}
-                >
-                  <button onClick={() => enterEditMode(blockMenu.entry)} disabled={readOnly || isSaving}>
-                    Edit
-                  </button>
-                  <button onClick={copyBlock} disabled={isSaving}>
-                    Copy
-                  </button>
-                  <button
-                    onClick={() => duplicateEntryToNextDay(blockMenu.entry, blockMenu.day)}
-                    disabled={isSaving}
-                  >
-                    Duplicate to Next Day
-                  </button>
-                  <button onClick={() => deleteEntry(blockMenu.entry)} disabled={readOnly || isSaving}>
-                    Delete
-                  </button>
-                </div>
-              )}
+            <div className={wideSplit ? "split-timetables" : "single-timetable"} ref={splitContainerRef}
+              style={wideSplit ? { gridTemplateColumns: `minmax(420px, ${paneRatio}fr) 8px minmax(420px, ${1 - paneRatio}fr)` } : undefined}>
+              {wideSplit ? renderTimetable("left") : renderTimetable(activePaneId)}
+              {wideSplit && <div className="pane-divider" role="separator" aria-label="Resize schedule panes" aria-orientation="vertical"
+                aria-valuenow={Math.round(paneRatio * 100)} aria-valuemin={20} aria-valuemax={80} tabIndex={0}
+                onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); }}
+                onPointerMove={event => { if (event.currentTarget.hasPointerCapture(event.pointerId)) resizeDivider(event.clientX); }}
+                onPointerUp={event => event.currentTarget.releasePointerCapture(event.pointerId)}
+                onDoubleClick={() => setPaneSettings(prev => ({ ...prev, ratio: 0.5 }))}
+                onKeyDown={event => {
+                  if (["ArrowLeft", "ArrowRight", "Home"].includes(event.key)) {
+                    event.preventDefault();
+                    const bounds = splitContainerRef.current?.getBoundingClientRect();
+                    if (bounds) resizeDivider(bounds.left + (bounds.width - 8) * (event.key === "Home" ? 0.5 : paneRatio + (event.key === "ArrowLeft" ? -0.03 : 0.03)));
+                  }
+                }} />}
+              {wideSplit && renderTimetable("right")}
             </div>
               )}
             </>
           )}
         </div>
 
-        <aside className={`panel ${formEditId ? "editing" : ""}`} ref={panelRef}>
-          <fieldset disabled={readOnly} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
-          {formEditId && (
-            <div className="edit-mode-banner">
-              <div>
-                <strong>Editing selected class</strong>
-                <span>
-                  {scheduleForm["Course Code"] || "Untitled class"} /{" "}
-                  {scheduleForm.Section || "No section"}
-                </span>
-              </div>
-              <button
-                className="secondary-button compact-button"
-                onClick={cancelEditMode}
-                disabled={isSaving}
-              >
-                Cancel
-              </button>
-            </div>
-          )}
-          <h3>{formEditId ? "Edit Class" : "Add Class"}</h3>
-          {activeCurriculumCourses.length > 0 ? (
-            <div className="form-note">
-              Curriculum: {curriculumTerm}
-              {formSectionYearLevel ? ` / ${formSectionYearLevel}` : ""}
-              {formSectionYearLevel && getYearLevelCurriculum(formSectionYearLevel)
-                ? ` / ${getYearLevelCurriculum(formSectionYearLevel)?.name}`
-                : ""} (
-              {getCurriculumCoursesForSection(scheduleForm.Section).length} courses)
-            </div>
-          ) : null}
-          <label>
-            Program
-            <input
-              value={scheduleForm.Program}
-              readOnly
-              onChange={(event) => {
-                const value = event.target.value;
-                setScheduleForm({ ...scheduleForm, Program: value });
-                localStorage.setItem("lastProgram", value);
-              }}
-            />
-          </label>
-          <label>
-            Section
-            <input
-              value={scheduleForm.Section}
-              onChange={(event) => {
-                const value = event.target.value;
-                setScheduleForm({ ...scheduleForm, Section: value });
-                localStorage.setItem("lastSection", value);
-              }}
-              list="section-list"
-            />
-            <datalist id="section-list">
-              {sections.map((section) => (
-                <option key={section.id} value={section.name} />
-              ))}
-            </datalist>
-          </label>
-          <label className="course-code-field">
-            Course Code
-            <input
-              ref={courseCodeRef}
-              className={selectedCoursePlotStatus.isOverPlotted ? "course-code-over-plotted" : selectedCoursePlotStatus.isComplete ? "course-code-complete" : ""}
-              value={scheduleForm["Course Code"]}
-              onChange={(event) => {
-                applyCourseCodeToScheduleForm(event.target.value);
-                openCourseCodeMenu();
-              }}
-              onFocus={openCourseCodeMenu}
-              onClick={openCourseCodeMenu}
-              onBlur={() => window.setTimeout(() => setIsCourseCodeMenuOpen(false), 120)}
-              autoComplete="off"
-            />
-            {scheduleForm["Course Code"] ? (
-              <div
-                className={`course-plot-status ${
-                  selectedCoursePlotStatus.isOverPlotted ? "over-plotted" : selectedCoursePlotStatus.isComplete ? "complete" : ""
-                }`}
-              >
-                {selectedCoursePlotStatus.requiredHours !== null
-                  ? `${formatHoursLabel(selectedCoursePlotStatus.plottedHours)} / ${formatHoursLabel(
-                      selectedCoursePlotStatus.requiredHours
-                    )} hrs plotted`
-                  : `${formatHoursLabel(selectedCoursePlotStatus.plottedHours)} hrs plotted`}
-                {selectedCoursePlotStatus.isOverPlotted ? " — Over-plotted: exceeds curriculum hours" : ""}
-              </div>
-            ) : null}
-            {isCourseCodeMenuOpen && visibleCourseCodeOptions.length > 0 ? (
-              <div className="course-code-menu-left" style={courseCodeMenuPosition}>
-                {visibleCourseCodeOptions.map((courseCode) => {
-                  const status = getCoursePlotStatus(courseCode, scheduleForm.Section, null);
-                  return (
-                    <button
-                      key={courseCode}
-                      type="button"
-                      className={status.isOverPlotted ? "over-plotted" : status.isComplete ? "complete" : ""}
-                      onMouseDown={(event) => {
-                        event.preventDefault();
-                        applyCourseCodeToScheduleForm(courseCode);
-                        setIsCourseCodeMenuOpen(false);
-                      }}
-                    >
-                      <span>{courseCode}</span>
-                      <span>{getCourseCodeOptionLabel(courseCode)}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            ) : null}
-            <datalist id="course-code-list">
-              {formCourseCodeOptions.map((courseCode) => (
-                <option
-                  key={courseCode}
-                  value={courseCode}
-                  label={getCourseCodeOptionLabel(courseCode)}
-                />
-              ))}
-            </datalist>
-          </label>
-          <label>
-            Course Description
-            <input
-              value={scheduleForm["Course Description"]}
-              readOnly={Boolean(getCanonicalCourseDescription(scheduleForm["Course Code"]))}
-              onChange={(event) => {
-                const canonical = getCanonicalCourseDescription(scheduleForm["Course Code"]);
-                setScheduleForm({
-                  ...scheduleForm,
-                  "Course Description": canonical || event.target.value,
-                });
-              }}
-            />
-          </label>
-          <label>
-            Units
-            <input
-              type="number"
-              value={scheduleForm.Units}
-              onChange={(event) =>
-                setScheduleForm({
-                  ...scheduleForm,
-                  Units: Number(event.target.value),
-                })
-              }
-            />
-          </label>
-          <label>
-            # of Hours
-            <input
-              type="number"
-              value={scheduleForm["# of Hours"]}
-              readOnly
-            />
-          </label>
-          <label>
-            Time (LPU Std)
-            <input
-              value={scheduleForm["Time (LPU Std)"]}
-              onChange={(event) => {
-                const value = event.target.value;
-                const parsed = parseLpuRange(value);
-                const isTbaValue = value.trim().toLowerCase() === "tba" || value.trim() === "";
-                setScheduleForm((prev) => ({
-                  ...prev,
-                  "Time (LPU Std)": value,
-                  "Time (24 Hrs)": parsed ? parsed.time24 : isTbaValue ? "" : prev["Time (24 Hrs)"],
-                }));
-                if (value && !parsed && !isTbaValue) {
-                  setFormError("Invalid Time (LPU Std). Example: 10:00a-12:00p");
-                } else {
-                  setFormError("");
-                }
-              }}
-            />
-          </label>
-          <label>
-            Time (24 Hrs)
-            <input
-              value={scheduleForm["Time (24 Hrs)"] ?? ""}
-              readOnly
-            />
-          </label>
-          <label>
-            Days
-            <input
-              value={scheduleForm.Days}
-              onChange={(event) =>
-                setScheduleForm({ ...scheduleForm, Days: event.target.value })
-              }
-              onBlur={(event) => {
-                const value = event.target.value;
-                const trimmed = value.trim();
-                setScheduleForm({
-                  ...scheduleForm,
-                  Days:
-                    trimmed.toLowerCase() === "tba" || trimmed === ""
-                      ? "TBA"
-                      : normalizeDays(value),
-                });
-              }}
-            />
-          </label>
-          <label>
-            Room
-            <input
-              value={scheduleForm.Room}
-              onChange={(event) =>
-                setScheduleForm({ ...scheduleForm, Room: event.target.value })
-              }
-              list="room-list"
-            />
-            <datalist id="room-list">
-              {rooms.map((room) => (
-                <option key={room.id} value={room.name} />
-              ))}
-            </datalist>
-          </label>
-          <label>
-            Faculty
-            <input
-              value={scheduleForm.Faculty}
-              onChange={(event) =>
-                setScheduleForm({ ...scheduleForm, Faculty: event.target.value })
-              }
-              list="faculty-list"
-            />
-            <datalist id="faculty-list">
-              {faculty.map((member) => (
-                <option key={member.id} value={member.name} />
-              ))}
-            </datalist>
-          </label>
-          <button onClick={handleCreateSchedule} disabled={isSaving}>
-            {formEditId ? "Save Changes to Selected Class" : "Add Class"}
-          </button>
-          {formEditId && (
-            <button className="secondary-button" onClick={cancelEditMode} disabled={isSaving}>
-              Cancel Edit
-            </button>
-          )}
-          {formError && <p className="error">{formError}</p>}
-
-          <h3>Add Section</h3>
-          <label>
-            Name
-            <input
-              value={newSection}
-              onChange={(event) => setNewSection(event.target.value)}
-            />
-          </label>
-          <button
-            onClick={() =>
-              handleCreateNamed("sections", newSection, () => setNewSection(""), "Section")
-            }
-          >
-            Add Section
-          </button>
-
-          </fieldset>
-          <h3>Add Faculty</h3>
-          <label>
-            Name
-            <input
-              value={newFaculty}
-              onChange={(event) => setNewFaculty(event.target.value)}
-            />
-          </label>
-          <button
-            onClick={() =>
-              handleCreateNamed("faculty", newFaculty, () => setNewFaculty(""), "Faculty")
-            }
-          >
-            Add Faculty
-          </button>
-
-          <h3>Add Room</h3>
-          <label>
-            Name
-            <input disabled={!isAdmin} value={newRoom} onChange={(event) => setNewRoom(event.target.value)} />
-          </label>
-          <button
-            disabled={!isAdmin}
-            onClick={() =>
-              handleCreateNamed("rooms", newRoom, () => setNewRoom(""), "Room")
-            }
-          >
-            Add Room
-          </button>
-          {!isAdmin && <p className="muted">Only administrators can add new rooms.</p>}
-        </aside>
+        <ClassEditor popup={splitMode} open={editorOpen} title={formEditId ? "Edit Class" : "Add Class"}
+          panelRef={panelRef} onClose={cancelEditMode} onSave={handleCreateSchedule} saving={isSaving}
+        >
+          {renderClassForm()}
+        </ClassEditor>
       </div>
     </div>
   );

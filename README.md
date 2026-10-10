@@ -48,3 +48,16 @@ Set `COOKIE_SECURE=false` for local HTTP development only. Production uses secur
 - Saves block cross-program room/faculty overlaps by default. **Rules** shows shared Ignore room/faculty conflicts switches; only admins can change them. Expand **Room exceptions** or **Faculty exceptions** to bypass checks for selected records while leaving global ignore switches off. Changes apply to every user/program and are audited and delivered live. When a check remains enabled, admin overrides require a recorded reason. Section overlaps cannot be ignored or overridden.
 
 Use **Hide live updates** in the top bar to hide the right activity panel and expand the scheduler; **Show live updates** restores it. Schedules continue updating live while the panel is hidden. The choice is remembered per account in this browser.
+
+- **Split View** shows independently selectable section, faculty, or room schedules. Room panes include every program; select a class's program before editing its bookings. The divider can be dragged or resized with arrow keys; double-click or Home resets it. A blue border marks the active pane.
+- Split View uses a popup class editor. Dragging across panes changes only the dragged meeting's section, faculty, or room to the destination selection; the preview shows the assignment and time. Conflicts block the move, and Undo restores the complete move.
+- Vertical scrolling is linked by time by default, even at different zoom levels. Horizontal scrolling remains independent. Below 900px, or when the activity panel leaves insufficient space, switch between the saved left and right panes using the pane buttons.
+- Current timetable PNG export uses the active pane; mass export keeps both displayed selections intact. Pane settings are remembered per account and program on this browser. Text View temporarily suspends Split View.
+- Ctrl/Cmd+C copies a focused class block, Ctrl/Cmd+V pastes into the active section view, and Ctrl/Cmd+Z undoes the latest action. These shortcuts leave text fields and popup drafts alone.
+- Meeting moves and reverts commit atomically. Undo references authoritative snapshots in Online activity history, checks ownership and current program permissions, and rejects later changes or new conflicts.
+
+## Verification
+
+Run `python -m pytest tests -q` from `backend/`. Tests use a temporary database.
+
+From `frontend/`, run `npm run build`, `npx playwright install chromium`, then `npm test` and `npm run test:browser`. Browser tests use isolated synthetic schedule data and do not modify the working database. To use an installed Chrome instead, set `SCHEDULER_TEST_BROWSER=chrome` before running the tests.

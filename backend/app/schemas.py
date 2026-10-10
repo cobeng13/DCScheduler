@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -71,6 +71,29 @@ class ScheduleEntry(ScheduleEntryBase):
     version: int
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+
+class MoveAssignment(BaseModel):
+    kind: Literal["section", "faculty", "room"]
+    name: str = Field(min_length=1, max_length=200)
+
+
+class MeetingMove(BaseModel):
+    source_day: str
+    destination_day: str
+    start_minutes: int = Field(strict=True)
+    assignment: Optional[MoveAssignment] = None
+    expected: ScheduleEntry
+
+
+class MeetingMoveSnapshot(BaseModel):
+    move_activity_id: int = Field(ge=1)
+
+
+class MeetingMoveResult(BaseModel):
+    entries: List[ScheduleEntry]
+    snapshot: Optional[MeetingMoveSnapshot]
+    moved_entry_id: int
 
 
 class NamedEntity(BaseModel):
