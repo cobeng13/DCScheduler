@@ -47,7 +47,7 @@ async function fixture(t, preferences, options = {}) {
   page.on('pageerror', error => errors.push(error.message));
   let entries = clone(initialEntries).map(entry => ({ ...entry, version: 1, program_id: 1, section_id: entry.Section === 'A' ? 1 : 2 })), snapshots = new Map(), moves = [], failedSaves = false, failedMoves = false;
   entries.push(...clone(options.extraEntries ?? []));
-  let catalogs = { '/sections': names(['A', 'B']), '/faculty': names(['Ada', 'Grace']), '/rooms': names(['R1', 'R2']) };
+  let catalogs = { '/sections': names(['A', 'B']), '/faculty': names(options.facultyNames ?? ['Ada', 'Grace']), '/rooms': names(['R1', 'R2']) };
   await page.addInitScript(() => { window.EventSource = class { addEventListener() {} close() {} }; localStorage.setItem('scheduler:activity-visible:1', 'false'); });
   if (preferences) await page.addInitScript(value => localStorage.setItem('online:1:1:scheduler.panes', JSON.stringify(value)), preferences);
   await page.route('**/api/**', async route => {
@@ -138,7 +138,8 @@ test('independent tabs and selectors, shared highlighting, popup edit, failure a
   setFailedSave(false);
   await dialog.getByRole('button', { name: 'Save', exact: true }).click();
   await dialog.waitFor({ state: 'hidden' });
-  assert.equal(await right.locator('.block').count(), 0);
+  assert.equal(await right.locator('select').inputValue(), 'Grace');
+  assert.equal(await right.locator('.block').count(), 3);
   assert.equal(await left.locator('.block').count(), 2);
   await left.locator('.block').first().click();
   await dialog.waitFor();
@@ -434,4 +435,32 @@ test('copying a shared-room booking pastes into the active program and section',
   const pasted = entries().find(entry => entry['Course Code'] === 'OTHER101' && entry.id !== 10);
   assert.equal(pasted.Program, 'BSCS');
   assert.equal(pasted.Section, 'A');
+});
+
+
+test('faculty timetable selectors hide zero-load and other-program teachers', async t => {
+  const other = { ...initialEntries[1], id: 10, Program: 'OTHER', program_id: 2, version: 1, Faculty: 'Other program' };
+  const { page, left, right } = await fixture(t, undefined, { facultyNames: ['Ada', 'Grace', 'No load', 'Other program'], extraEntries: [other] });
+  assert.deepEqual(await right.locator('select option').evaluateAll(options => options.map(option => option.value)), ['Ada', 'Grace']);
+  await left.getByRole('tab', { name: 'Faculty', exact: true }).click();
+  assert.deepEqual(await left.locator('select option').evaluateAll(options => options.map(option => option.value)), ['Ada', 'Grace']);
+  await page.getByRole('button', { name: 'Single View', exact: true }).click();
+  assert.deepEqual(await left.locator('select option').evaluateAll(options => options.map(option => option.value)), ['Ada', 'Grace']);
+  // Catalog faculty remain assignable when adding a teacher's first class.
+  assert.ok(await page.locator('#faculty-list option[value="No load"]').count());
+});
+
+test('move notices expire or dismiss without removing Undo', async t => {
+  const { page, left, right } = await fixture(t);
+  await right.locator('select').selectOption('Grace');
+  await left.locator('.block').first().dragTo(right.locator('[data-day="T"][data-slot="480"]'));
+  await page.getByText('Class moved', { exact: true }).waitFor();
+  await page.getByText('Class moved', { exact: true }).waitFor({ state: 'hidden', timeout: 8000 });
+  await page.keyboard.press('Control+z');
+  await waitFor(page, () => document.querySelectorAll('[aria-label="left schedule"] .block[data-entry-id="1"]').length === 2);
+  await left.locator('.block').first().dragTo(right.locator('[data-day="T"][data-slot="480"]'));
+  await page.getByRole('button', { name: 'Dismiss move notice', exact: true }).click();
+  assert.equal(await page.getByText('Class moved', { exact: true }).count(), 0);
+  await page.keyboard.press('Control+z');
+  await waitFor(page, () => document.querySelectorAll('[aria-label="left schedule"] .block[data-entry-id="1"]').length === 2);
 });

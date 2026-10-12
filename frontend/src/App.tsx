@@ -1122,6 +1122,19 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
 
   const sectionOptions = useMemo(() => sortEntities(sections), [sections]);
   const facultyOptions = useMemo(() => sortEntities(faculty), [faculty]);
+  const facultyLoadHours = useMemo(() => {
+    const loads: Record<string, number> = {};
+    entries.forEach((entry) => {
+      const key = normalizeMatchValue(entry.Faculty);
+      if (!key) return;
+      loads[key] = (loads[key] ?? 0) + getEntryWeeklyHours(entry);
+    });
+    return loads;
+  }, [entries]);
+  const timetableFacultyOptions = useMemo(
+    () => activeProgram ? facultyOptions.filter(member => (facultyLoadHours[normalizeMatchValue(member.name)] ?? 0) > 0) : facultyOptions,
+    [activeProgram, facultyOptions, facultyLoadHours]
+  );
   const roomOptions = useMemo(() => sortEntities(rooms), [rooms]);
 
   useEffect(() => {
@@ -1170,7 +1183,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     if (viewMode === "timetable-faculty") {
       return {
         label: "faculty",
-        entities: facultyOptions,
+        entities: timetableFacultyOptions,
         selected: selectedFaculty,
         setSelected: setSelectedFaculty,
       };
@@ -1192,7 +1205,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   }, [
     viewMode,
     sectionOptions,
-    facultyOptions,
+    timetableFacultyOptions,
     roomOptions,
     selectedSection,
     selectedFaculty,
@@ -1711,7 +1724,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       let changed = false;
       for (const id of ["left", "right"] as const) {
         const pane = { ...prev[id] };
-        for (const [kind, options] of [["section", sectionOptions], ["faculty", facultyOptions], ["room", roomOptions]] as const) {
+        for (const [kind, options] of [["section", sectionOptions], ["faculty", timetableFacultyOptions], ["room", roomOptions]] as const) {
           if (!options.some(entity => entity.name === pane[kind])) {
             const name = options[0]?.name ?? "";
             if (pane[kind] !== name) { pane[kind] = name; changed = true; }
@@ -1721,7 +1734,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       }
       return changed ? next : prev;
     });
-  }, [scheduleLoaded, sectionOptions, facultyOptions, roomOptions]);
+  }, [scheduleLoaded, sectionOptions, timetableFacultyOptions, roomOptions]);
 
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
@@ -1757,8 +1770,8 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   }, []);
 
   useEffect(() => {
-    if (!toast || toast.showRevert || isExporting) return;
-    const timeout = window.setTimeout(() => setToast(null), 3000);
+    if (!toast || isExporting) return;
+    const timeout = window.setTimeout(() => setToast(null), toast.showRevert ? 5000 : 3000);
     return () => window.clearTimeout(timeout);
   }, [toast, isExporting]);
 
@@ -3249,15 +3262,6 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
         (sections.length === 0 || (isTimetableView && currentViewConfig.entities.length === 0));
   const canExportTimetable =
     isTimetableView && Boolean(effectiveSelection) && currentViewConfig.entities.length > 0;
-  const facultyLoadHours = useMemo(() => {
-    const loads: Record<string, number> = {};
-    entries.forEach((entry) => {
-      const key = normalizeMatchValue(entry.Faculty);
-      if (!key) return;
-      loads[key] = (loads[key] ?? 0) + getEntryWeeklyHours(entry);
-    });
-    return loads;
-  }, [entries]);
   const formatHoursLabel = (hours: number) => {
     const rounded = roundHours(hours);
     return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
@@ -3362,7 +3366,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     const pane = exportPane ?? paneSettings[id];
     const viewMode = pane.mode;
     const kind = paneField(viewMode);
-    const entities = kind === "section" ? sectionOptions : kind === "faculty" ? facultyOptions : roomOptions;
+    const entities = kind === "section" ? sectionOptions : kind === "faculty" ? (capture ? facultyOptions : timetableFacultyOptions) : roomOptions;
     const effectiveSelection = pane[kind] || entities[0]?.name || "";
     const currentViewConfig = { selected: effectiveSelection, entities, label: kind, setSelected: (name: string) => { activatePane(id); updatePane(id, { [kind]: name }); } };
     const currentSectionBg = kind === "section" ? customizeSettings.sectionBgColors[effectiveSelection] : undefined;
@@ -3442,13 +3446,14 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                 </div>
               </div>
               {!capture && activePaneId === id && toast && toast.showRevert && (
-                <div className="toast overlay">
+                <div className="toast overlay" role="status" aria-live="polite">
                   <span>{toast.message}</span>
                   {toast.showRevert && moveSnapshot && (
-                    <button className="nav-button" onClick={handleRevertMove}>
+                    <button className="nav-button" disabled={isSaving} onClick={handleRevertMove}>
                       Revert
                     </button>
                   )}
+                  <button className="nav-button" aria-label="Dismiss move notice" onClick={() => setToast(null)}>&times;</button>
                 </div>
               )}
               {currentViewConfig.entities.length === 0 ? (
