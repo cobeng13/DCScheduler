@@ -8,6 +8,7 @@ import { request as onlineRequest, schedulerFetch as fetch, readSchedule, pinVer
 import { ClassEditor } from "./ClassEditor";
 import { TimetablePane } from "./TimetablePane";
 import { SectionScheduleExport } from "./SectionScheduleExport";
+import { RoomScheduleExport } from "./RoomScheduleExport";
 import { assignmentForPane, linkedScrollTop, loadPaneSettings, paneField, type PaneId, type PaneState, type TimetableMode } from "./panes";
 
 type ScheduleEntry = {
@@ -657,6 +658,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   const [openExportSubmenu, setOpenExportSubmenu] = useState(false);
   const [isFacultyLoadExportOpen, setIsFacultyLoadExportOpen] = useState(false);
   const [isSectionScheduleExportOpen, setIsSectionScheduleExportOpen] = useState(false);
+  const [isRoomScheduleExportOpen, setIsRoomScheduleExportOpen] = useState(false);
   const [facultyLoadExportNames, setFacultyLoadExportNames] = useState<string[]>([]);
   const rulesVersion = useRef(1);
   const rulesSnapshot = useRef<SharedConflictRules>({ ignoreRoom: false, ignoreFaculty: false, ignoreRoomIds: [], ignoreFacultyIds: [] });
@@ -1138,6 +1140,8 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     [activeProgram, facultyOptions, facultyLoadHours]
   );
   const roomOptions = useMemo(() => sortEntities(rooms), [rooms]);
+  const exportRoomOptions = useMemo(() => roomOptions.filter(room => !ruleExceptions.ignoreRoomIds.includes(room.id)),
+    [roomOptions, ruleExceptions.ignoreRoomIds]);
 
   useEffect(() => {
     if (!selectedFacultyColor && facultyOptions.length > 0) {
@@ -3902,7 +3906,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
-      if (editorOpen || isSectionScheduleExportOpen || isSaving || isExporting || target?.closest("input, textarea, select, [contenteditable=true]")) return;
+      if (editorOpen || isSectionScheduleExportOpen || isRoomScheduleExportOpen || isSaving || isExporting || target?.closest("input, textarea, select, [contenteditable=true]")) return;
       if (!event.ctrlKey && !event.metaKey) return;
       const key = event.key.toLowerCase();
       if (key === "z" && !event.shiftKey) {
@@ -4089,6 +4093,10 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                   <button className="menu-item" type="button" disabled={isExporting}
                     onClick={() => { setIsSectionScheduleExportOpen(true); setOpenMenu(null); }}>
                     Export Section Schedule (Excel)
+                  </button>
+                  <button className="menu-item" type="button" disabled={isExporting}
+                    onClick={() => { setIsRoomScheduleExportOpen(true); setOpenMenu(null); }}>
+                    Export Room Schedule (Excel)
                   </button>
                   <button
                     className="menu-item"
@@ -4301,6 +4309,9 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       {isSectionScheduleExportOpen && <SectionScheduleExport program={activeProgram} sections={sectionOptions}
         selectedSection={selectedSection} onClose={() => setIsSectionScheduleExportOpen(false)}
         onExported={() => setToast({ message: "Excel schedule exported", showRevert: false })} />}
+      {isRoomScheduleExportOpen && <RoomScheduleExport rooms={exportRoomOptions}
+        onClose={() => setIsRoomScheduleExportOpen(false)}
+        onExported={() => setToast({ message: "Room Excel schedule exported", showRevert: false })} />}
       {isFacultyLoadExportOpen ? (
         <div className="modal-overlay">
           <div className="modal">

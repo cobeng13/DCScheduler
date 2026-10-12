@@ -82,6 +82,7 @@ export type SectionScheduleOptions = {
   institution: string;
   college: string;
   title: string;
+  includeRooms?: boolean;
 };
 
 export async function downloadSectionSchedule(options: SectionScheduleOptions): Promise<Blob> {
@@ -92,8 +93,36 @@ export async function downloadSectionSchedule(options: SectionScheduleOptions): 
     institution: options.institution, college: options.college, title: options.title });
   if (options.scope !== "all") query.set("program_id", String(activeProgram!.id));
   if (options.scope === "sections") options.sectionIds.forEach(id => query.append("section_ids", String(id)));
+  if (options.includeRooms) query.set("include_rooms", "true");
   // All-program downloads must bypass the legacy transport's program scoping.
   const response = await window.fetch(`/api/reports/section-schedule.xlsx?${query}`, {
+    headers: { "X-CSRF-Token": csrf }, credentials: "same-origin",
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    if (response.status === 401) window.dispatchEvent(new Event("scheduler-session-expired"));
+    throw new Error(errorMessage(body.detail));
+  }
+  return response.blob();
+}
+
+export type RoomScheduleOptions = {
+  roomIds: number[] | null;
+  schoolYear: string;
+  institution: string;
+  college: string;
+  title: string;
+  includeSunday: boolean;
+};
+
+export async function downloadRoomSchedule(options: RoomScheduleOptions): Promise<Blob> {
+  if (!options.schoolYear.trim() || !options.title.trim()) throw new Error("Enter a school year and report title.");
+  if (options.roomIds !== null && !options.roomIds.length) throw new Error("Select at least one room.");
+  const query = new URLSearchParams({ school_year: options.schoolYear, institution: options.institution,
+    college: options.college, title: options.title, include_sunday: String(options.includeSunday) });
+  options.roomIds?.forEach(id => query.append("room_ids", String(id)));
+  // Shared rooms always include all programs, including when a program is selected.
+  const response = await window.fetch(`/api/reports/room-schedule.xlsx?${query}`, {
     headers: { "X-CSRF-Token": csrf }, credentials: "same-origin",
   });
   if (!response.ok) {

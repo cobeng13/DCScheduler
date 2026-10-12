@@ -44,7 +44,7 @@ export function SectionScheduleExport({ program, sections, selectedSection, onCl
       anchor.download = options.scope === "all" ? "all-program-schedules.xlsx" : `${program.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")}-section-schedules.xlsx`;
       document.body.appendChild(anchor); anchor.click(); anchor.remove();
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-      const { scope: _scope, sectionIds: _ids, ...headings } = options;
+      const { scope: _scope, sectionIds: _ids, includeRooms: _rooms, ...headings } = options;
       try { scopedStorage.setItem("scheduler.sectionSchedule.headings", JSON.stringify(headings)); } catch { /* Download still succeeds without preference storage. */ }
       onExported(); onClose();
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not export the schedule. Try again."); }
@@ -62,6 +62,9 @@ export function SectionScheduleExport({ program, sections, selectedSection, onCl
             <option value="all">All programs (separate worksheets)</option>
           </select>
         </label>
+        <label className="menu-checkbox"><input type="checkbox" checked={!!options.includeRooms}
+          onChange={event => field("includeRooms", event.target.checked)} />Include room schedules (all programs, 30-minute rows)</label>
+        {options.includeRooms && <p className="modal-note">Rooms marked Ignore conflicts are excluded from the room worksheets.</p>}
         {options.scope === "sections" && <div>
           <label className="menu-checkbox"><input type="checkbox" checked={sections.length > 0 && options.sectionIds.length === sections.length}
             onChange={event => field("sectionIds", event.target.checked ? sections.map(section => section.id) : [])} />Select all sections</label>

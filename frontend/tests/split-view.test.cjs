@@ -53,8 +53,8 @@ async function fixture(t, preferences, options = {}) {
   await page.route('**/api/**', async route => {
     const request = route.request(), url = new URL(request.url()), method = request.method();
     url.pathname = url.pathname.replace(/^\/api/, '');
-    if (url.pathname === '/reports/section-schedule.xlsx') {
-      excelRequests.push(Object.fromEntries(url.searchParams));
+    if (['/reports/section-schedule.xlsx', '/reports/room-schedule.xlsx'].includes(url.pathname)) {
+      excelRequests.push({ ...Object.fromEntries(url.searchParams), path: url.pathname });
       await route.fulfill(failedExports
         ? { status: 422, contentType: 'application/json', body: JSON.stringify({ detail: 'Simulated export failure' }) }
         : { contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: Buffer.from('synthetic-xlsx-download') });
@@ -68,7 +68,7 @@ async function fixture(t, preferences, options = {}) {
     else if (url.pathname === '/programs') body = [{ id: 1, name: 'BSCS', assigned_user_id: options.readOnly ? 99 : 1, version: 1 }];
     else if (['/activity', '/activity/actors', '/presence'].includes(url.pathname)) body = [];
     else if (url.pathname === '/presence/heartbeat') body = { ok: true };
-    else if (url.pathname === '/rules') body = { rules: { ignoreRoom: false, ignoreFaculty: false, ignoreRoomIds: [], ignoreFacultyIds: [] }, version: 1 };
+    else if (url.pathname === '/rules') body = { rules: { ignoreRoom: false, ignoreFaculty: false, ignoreRoomIds: options.ignoredRoomIds ?? [], ignoreFacultyIds: [] }, version: 1 };
     else if (url.pathname === '/settings') body = { version: 1, settings: { curriculumState: { curricula: [], selectedTerm: 'First Semester', sectionYearLevels: {}, yearLevelCurriculumIds: {} } } };
     else if (url.pathname === '/conflicts') body = { conflicts: options.conflicts ?? [] };
     else if (list[url.pathname]) body = list[url.pathname];
@@ -502,11 +502,13 @@ test('Excel export selects sections or programs and preserves headings on failur
   await page.getByRole('button', { name: 'Export Section Schedule (Excel)', exact: true }).click();
   assert.equal(await dialog.getByLabel('Report title', { exact: true }).inputValue(), 'Schedule for review');
   await dialog.getByLabel('Export scope', { exact: true }).selectOption('all');
+  await dialog.getByLabel('Include room schedules (all programs, 30-minute rows)', { exact: true }).check();
   const allDownloaded = page.waitForEvent('download');
   await dialog.getByRole('button', { name: 'Download Excel', exact: true }).click();
   assert.equal((await allDownloaded).suggestedFilename(), 'all-program-schedules.xlsx');
   assert.equal(excelRequests.at(-1).scope, 'all');
   assert.equal(excelRequests.at(-1).program_id, undefined);
+  assert.equal(excelRequests.at(-1).include_rooms, 'true');
 });
 
 test('read-only users can export a program and Escape closes the export dialog', async t => {
@@ -525,4 +527,36 @@ test('read-only users can export a program and Escape closes the export dialog',
   await dialog.getByRole('button', { name: 'Download Excel', exact: true }).click();
   await downloaded;
   assert.equal(excelRequests[0].scope, 'program');
+});
+
+test('room Excel export supports room selection, failed drafts and read-only users', async t => {
+  const { page, left, right, excelRequests, setFailedExport } = await fixture(t, undefined, { readOnly: true, ignoredRoomIds: [2] });
+  await page.getByRole('button', { name: 'Export ▼', exact: true }).click();
+  await page.getByRole('button', { name: 'Export Room Schedule (Excel)', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Export Room Schedule (Excel)', exact: true });
+  await dialog.waitFor();
+  assert.equal(await dialog.evaluate(element => element.contains(document.activeElement)), true);
+  await dialog.getByLabel('Rooms', { exact: true }).selectOption('selected');
+  assert.equal(await dialog.getByLabel('R2', { exact: true }).count(), 0);
+  assert.equal(await dialog.getByLabel('R1', { exact: true }).isChecked(), true);
+  await dialog.getByLabel('Report title', { exact: true }).fill('Room allocation');
+  setFailedExport(true);
+  await dialog.getByRole('button', { name: 'Download Excel', exact: true }).click();
+  await dialog.getByRole('alert').waitFor();
+  assert.equal(await dialog.getByLabel('Report title', { exact: true }).inputValue(), 'Room allocation');
+  setFailedExport(false);
+  const downloaded = page.waitForEvent('download');
+  await dialog.getByRole('button', { name: 'Download Excel', exact: true }).click();
+  assert.equal((await downloaded).suggestedFilename(), 'room-schedules.xlsx');
+  await dialog.waitFor({ state: 'hidden' });
+  assert.equal(excelRequests.at(-1).path, '/reports/room-schedule.xlsx');
+  assert.equal(excelRequests.at(-1).room_ids, '1');
+  assert.equal(excelRequests.at(-1).program_id, undefined);
+  assert.equal(await left.locator('select').inputValue(), 'A');
+  assert.equal(await right.locator('select').inputValue(), 'Ada');
+  await page.getByRole('button', { name: 'Export ▼', exact: true }).click();
+  await page.getByRole('button', { name: 'Export Room Schedule (Excel)', exact: true }).click();
+  assert.equal(await dialog.getByLabel('Report title', { exact: true }).inputValue(), 'Room allocation');
+  await page.keyboard.press('Escape');
+  await dialog.waitFor({ state: 'hidden' });
 });

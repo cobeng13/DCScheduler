@@ -140,7 +140,7 @@ def wrapped_height(values, widths):
     return max(21, 16 * lines + 5)
 
 
-def build_workbook(programs, school_year, institution=DEFAULT_INSTITUTION, college=DEFAULT_COLLEGE, title='SCHEDULE OF CLASSES'):
+def build_workbook(programs, school_year, institution=DEFAULT_INSTITUTION, college=DEFAULT_COLLEGE, title='SCHEDULE OF CLASSES', room_export=None):
     workbook = Workbook()
     workbook.remove(workbook.active)
     workbook.calculation.fullCalcOnLoad = True
@@ -250,6 +250,9 @@ def build_workbook(programs, school_year, institution=DEFAULT_INSTITUTION, colle
         sheet.print_area = f'A1:H{max(8, row - 2)}'
     if not workbook.worksheets:
         raise HTTPException(422, 'There are no programs to export.')
+    if room_export is not None:
+        from .room_schedule import append_sheets
+        append_sheets(workbook, room_export['rooms'], room_export['entries'], school_year, institution, college)
     output = io.BytesIO()
     workbook.save(output)
     return output.getvalue()

@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from . import auth, models, moves, online_service as service, reports, schemas
 from . import database_archive as archive
-from . import section_schedule
+from . import section_schedule, room_schedule
 from .db import SessionLocal
 from .limits import BodyLimitMiddleware, bounded_json, PREFERENCES_BYTES
 
@@ -818,6 +818,7 @@ def section_schedule_export(
     institution: str = Query(default=section_schedule.DEFAULT_INSTITUTION, max_length=200),
     college: str = Query(default=section_schedule.DEFAULT_COLLEGE, max_length=200),
     title: str = Query(default="SCHEDULE OF CLASSES", min_length=1, max_length=200),
+    include_rooms: bool = False,
     db: Session = Db, user=User,
 ):
     # Online allows signed-in users to view every program. Capture a consistent
@@ -852,11 +853,53 @@ def section_schedule_export(
                  "sections": [{"name": section.name, "entries": entry_groups.get(section.id, [])}
                               for section in selected_sections if section.program_id == program.id]}
                 for program in selected_programs]
+    room_export = capture_room_schedule(db) if include_rooms else None
     db.rollback()
-    content = section_schedule.build_workbook(captured, school_year, institution, college, title)
+    content = section_schedule.build_workbook(captured, school_year, institution, college, title, room_export)
     filename = "all-program-schedules.xlsx" if scope == "all" else "section-schedules.xlsx"
     return Response(content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+def capture_room_schedule(db, room_ids=None):
+    rooms = list(db.scalars(select(models.Room)))
+    rules, _ = service.scheduling_rules(db)
+    ignored = set(rules['ignoreRoomIds'])
+    if room_ids is not None:
+        requested = set(room_ids)
+        if not requested or not requested.issubset({room.id for room in rooms}):
+            raise HTTPException(422, "Select existing rooms to export.")
+        rooms = [room for room in rooms if room.id in requested]
+    rooms = [room for room in rooms if room.id not in ignored]
+    query = select(models.ScheduleEntry).order_by(models.ScheduleEntry.id)
+    if ignored:
+        # Intentionally excluded bookings must not reappear on the TBA sheet.
+        query = query.where(or_(models.ScheduleEntry.room_id.not_in(ignored), models.ScheduleEntry.room_id.is_(None)))
+    if room_ids is not None:
+        query = query.where(or_(models.ScheduleEntry.room_id.in_(room_ids), models.ScheduleEntry.room_id.is_(None)))
+    return {"rooms": [{"id": room.id, "name": room.name} for room in rooms],
+            "entries": [service.serialize(entry) for entry in db.scalars(query)]}
+
+
+@api.get("/reports/room-schedule.xlsx")
+def room_schedule_export(
+    room_ids: list[int] | None = Query(default=None),
+    school_year: str = Query(min_length=1, max_length=40),
+    institution: str = Query(default=section_schedule.DEFAULT_INSTITUTION, max_length=200),
+    college: str = Query(default=section_schedule.DEFAULT_COLLEGE, max_length=200),
+    title: str = Query(default="ROOM SCHEDULE", min_length=1, max_length=200),
+    include_sunday: bool = False,
+    db: Session = Db, user=User,
+):
+    if not school_year.strip() or not title.strip():
+        raise HTTPException(422, "Enter a school year and report title.")
+    auth.lock(db)
+    captured = capture_room_schedule(db, room_ids)
+    db.rollback()
+    content = room_schedule.build_workbook(**captured, school_year=school_year, institution=institution,
+                                          college=college, title=title, include_sunday=include_sunday)
+    return Response(content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="room-schedules.xlsx"'})
 
 
 @api.post("/export/png")

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
-import { configure, schedulerFetch, readSchedule, pinVersion, withExpectedVersions, scopedStorage, errorMessage, request, downloadDatabaseBackup, downloadSectionSchedule } from "../src/online.ts";
+import { configure, schedulerFetch, readSchedule, pinVersion, withExpectedVersions, scopedStorage, errorMessage, request, downloadDatabaseBackup, downloadSectionSchedule, downloadRoomSchedule } from "../src/online.ts";
 
 const alpha = { id: 2, username: "alpha", is_admin: false, disabled: false, must_change_password: false };
 const program = { id: 1, name: "P1", assigned_user_id: 2, version: 1 };
@@ -229,4 +229,40 @@ test("Excel downloads are available in read-only programs and preserve useful fa
   await assert.rejects(downloadSectionSchedule(excelOptions), /Select a program/);
   configure(alpha, "csrf-test", program);
   await assert.rejects(downloadSectionSchedule({ ...excelOptions, scope: "sections" }), /Select at least one section/);
+});
+
+test("combined Excel downloads explicitly include shared room sheets", async () => {
+  responses.push({});
+  await downloadSectionSchedule({ ...excelOptions, includeRooms: true });
+  const query = new URL(calls.at(-1).url, window.location.origin).searchParams;
+  assert.equal(query.get("include_rooms"), "true");
+  assert.equal(query.get("program_id"), "1");
+});
+
+const roomOptions = { schoolYear: "2026", institution: "CAMP", college: "College", title: "Rooms", roomIds: null, includeSunday: false };
+
+test("room Excel export never applies a program filter and supports selected rooms", async () => {
+  for (const active of [program, null, { ...program, assigned_user_id: 99 }]) {
+    configure(alpha, "csrf-test", active);
+    responses.push({});
+    const blob = await downloadRoomSchedule({ ...roomOptions, roomIds: [1, 2], includeSunday: true });
+    assert.ok(blob.size > 0);
+    const call = calls.at(-1), url = new URL(call.url, window.location.origin);
+    assert.equal(url.pathname, "/api/reports/room-schedule.xlsx");
+    assert.deepEqual(url.searchParams.getAll("room_ids"), ["1", "2"]);
+    assert.equal(url.searchParams.get("include_sunday"), "true");
+    assert.equal(url.searchParams.has("program_id"), false);
+    assert.equal(call.init.credentials, "same-origin");
+    assert.equal(call.init.headers["X-CSRF-Token"], "csrf-test");
+  }
+  responses.push({});
+  await downloadRoomSchedule(roomOptions);
+  assert.equal(new URL(calls.at(-1).url, window.location.origin).searchParams.has("room_ids"), false);
+});
+
+test("room download validates selection and retains server errors", async () => {
+  await assert.rejects(downloadRoomSchedule({ ...roomOptions, roomIds: [] }), /Select at least one room/);
+  await assert.rejects(downloadRoomSchedule({ ...roomOptions, title: " " }), /Enter a school year/);
+  responses.push({ status: 422, body: { detail: "Room no longer exists" } });
+  await assert.rejects(downloadRoomSchedule(roomOptions), /Room no longer exists/);
 });
