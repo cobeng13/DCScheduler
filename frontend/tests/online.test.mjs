@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
-import { configure, schedulerFetch, readSchedule, pinVersion, withExpectedVersions, scopedStorage, errorMessage, request, downloadDatabaseBackup } from "../src/online.ts";
+import { configure, schedulerFetch, readSchedule, pinVersion, withExpectedVersions, scopedStorage, errorMessage, request, downloadDatabaseBackup, downloadSectionSchedule } from "../src/online.ts";
 
 const alpha = { id: 2, username: "alpha", is_admin: false, disabled: false, must_change_password: false };
 const program = { id: 1, name: "P1", assigned_user_id: 2, version: 1 };
@@ -191,4 +191,42 @@ test("one schedule collection filters the selected program while preserving shar
   responses.push({});
   await schedulerFetch('https://scheduler.test/api/schedule/1', { method: 'PUT', body: JSON.stringify({}) });
   assert.equal(JSON.parse(calls[1].init.body).version, 3);
+});
+
+const excelOptions = { scope: "program", sectionIds: [], schoolYear: "2026 - 2027", institution: "CAMP", college: "College", title: "Schedule" };
+
+test("program and selected-section Excel downloads use explicit scope and authentication", async () => {
+  for (const scope of ["program", "sections"]) {
+    responses.push({});
+    const blob = await downloadSectionSchedule({ ...excelOptions, scope, sectionIds: [3, 5] });
+    assert.ok(blob.size > 0);
+    const call = calls.at(-1), url = new URL(call.url, window.location.origin);
+    assert.equal(url.searchParams.get("scope"), scope);
+    assert.equal(url.searchParams.get("program_id"), "1");
+    assert.deepEqual(url.searchParams.getAll("section_ids"), scope === "sections" ? ["3", "5"] : []);
+    assert.equal(call.init.credentials, "same-origin");
+    assert.equal(call.init.headers["X-CSRF-Token"], "csrf-test");
+  }
+});
+
+test("all-program Excel export never inherits the selected program filter", async () => {
+  for (const active of [program, null]) {
+    configure(alpha, "csrf-test", active);
+    responses.push({});
+    await downloadSectionSchedule({ ...excelOptions, scope: "all", sectionIds: [3] });
+    const query = new URL(calls.at(-1).url, window.location.origin).searchParams;
+    assert.equal(query.get("scope"), "all");
+    assert.equal(query.has("program_id"), false);
+    assert.equal(query.has("section_ids"), false);
+  }
+});
+
+test("Excel downloads are available in read-only programs and preserve useful failures", async () => {
+  configure(alpha, "csrf-test", { ...program, assigned_user_id: 99 });
+  responses.push({ status: 422, body: { detail: "Review the assigned curriculum" } });
+  await assert.rejects(downloadSectionSchedule(excelOptions), /Review the assigned curriculum/);
+  configure(alpha, "csrf-test", null);
+  await assert.rejects(downloadSectionSchedule(excelOptions), /Select a program/);
+  configure(alpha, "csrf-test", program);
+  await assert.rejects(downloadSectionSchedule({ ...excelOptions, scope: "sections" }), /Select at least one section/);
 });

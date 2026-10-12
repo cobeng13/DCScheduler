@@ -55,6 +55,7 @@ Use **Hide live updates** in the top bar to hide the right activity panel and ex
 - Current timetable PNG export uses the active pane; mass export keeps both displayed selections intact. Pane settings are remembered per account and program on this browser. Text View temporarily suspends Split View.
 - Ctrl/Cmd+C copies a focused class block, Ctrl/Cmd+V pastes into the active section view, and Ctrl/Cmd+Z undoes the latest action. These shortcuts leave text fields and popup drafts alone.
 - Meeting moves and reverts commit atomically. Undo references authoritative snapshots in Online activity history, checks ownership and current program permissions, and rejects later changes or new conflicts.
+- **Export > Export Section Schedule (Excel)** creates the CAMP course-table layout for selected sections, an entire program, or every program in separate worksheets. It includes the full assigned curriculum for each program's current semester, shows unscheduled meetings as TBA, preserves faculty names, and omits teaching modality. Multiple meetings share course details so units and required hours count once. School year and report headings are editable and remembered in this browser. Missing curriculum/year-level assignments are explicitly marked as incomplete; entered classes are still included. Assign these in **Edit Sections** for complete exports.
 
 ## Verification
 

@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from . import auth, models, moves, online_service as service, reports, schemas
 from . import database_archive as archive
+from . import section_schedule
 from .db import SessionLocal
 from .limits import BodyLimitMiddleware, bounded_json, PREFERENCES_BYTES
 
@@ -806,6 +807,56 @@ def faculty_export(faculty: str, db: Session = Db, user=User):
     entries = list_schedule(faculty=faculty, db=db, user=user)
     return Response(reports.build_faculty_load_html(faculty, [service.serialize(e) for e in entries]), media_type="text/html",
         headers={"Content-Disposition": 'attachment; filename="faculty-load.html"'})
+
+
+@api.get("/reports/section-schedule.xlsx")
+def section_schedule_export(
+    scope: str = Query(default="program", pattern="^(sections|program|all)$"),
+    program_id: int | None = None,
+    section_ids: list[int] | None = Query(default=None),
+    school_year: str = Query(min_length=1, max_length=40),
+    institution: str = Query(default=section_schedule.DEFAULT_INSTITUTION, max_length=200),
+    college: str = Query(default=section_schedule.DEFAULT_COLLEGE, max_length=200),
+    title: str = Query(default="SCHEDULE OF CLASSES", min_length=1, max_length=200),
+    db: Session = Db, user=User,
+):
+    # Online allows signed-in users to view every program. Capture a consistent
+    # collection under the normal mutation lock, then release it before formatting.
+    if not school_year.strip() or not title.strip():
+        raise HTTPException(422, "Enter a school year and report title.")
+    auth.lock(db)
+    if scope == "all":
+        if program_id is not None or section_ids is not None:
+            raise HTTPException(422, "All-program export cannot include program or section filters.")
+        selected_programs = list(db.scalars(select(models.Program).order_by(models.Program.id)))
+    else:
+        selected_programs = [require_program(db, program_id)]
+        if scope == "sections" and not section_ids:
+            raise HTTPException(422, "Select at least one section to export.")
+        if scope == "program" and section_ids is not None:
+            raise HTTPException(422, "Use selected-section export to filter sections.")
+    ids = [program.id for program in selected_programs]
+    selected_sections = list(db.scalars(select(models.Section).where(models.Section.program_id.in_(ids))))
+    if scope == "sections":
+        requested = set(section_ids)
+        if not requested.issubset({section.id for section in selected_sections}):
+            raise HTTPException(422, "Select existing sections belonging to this program.")
+        selected_sections = [section for section in selected_sections if section.id in requested]
+    selected_ids = [section.id for section in selected_sections]
+    entry_groups = {}
+    for entry in db.scalars(select(models.ScheduleEntry).where(
+        models.ScheduleEntry.program_id.in_(ids), models.ScheduleEntry.section_id.in_(selected_ids)
+    ).order_by(models.ScheduleEntry.id)):
+        entry_groups.setdefault(entry.section_id, []).append(service.serialize(entry))
+    captured = [{"name": program.name, "settings_json": program.settings_json,
+                 "sections": [{"name": section.name, "entries": entry_groups.get(section.id, [])}
+                              for section in selected_sections if section.program_id == program.id]}
+                for program in selected_programs]
+    db.rollback()
+    content = section_schedule.build_workbook(captured, school_year, institution, college, title)
+    filename = "all-program-schedules.xlsx" if scope == "all" else "section-schedules.xlsx"
+    return Response(content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @api.post("/export/png")

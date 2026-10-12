@@ -45,7 +45,7 @@ async function fixture(t, preferences, options = {}) {
   const page = await context.newPage();
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
-  let entries = clone(initialEntries).map(entry => ({ ...entry, version: 1, program_id: 1, section_id: entry.Section === 'A' ? 1 : 2 })), snapshots = new Map(), moves = [], failedSaves = false, failedMoves = false;
+  let entries = clone(initialEntries).map(entry => ({ ...entry, version: 1, program_id: 1, section_id: entry.Section === 'A' ? 1 : 2 })), snapshots = new Map(), moves = [], excelRequests = [], failedSaves = false, failedMoves = false, failedExports = false;
   entries.push(...clone(options.extraEntries ?? []));
   let catalogs = { '/sections': names(['A', 'B']), '/faculty': names(options.facultyNames ?? ['Ada', 'Grace']), '/rooms': names(['R1', 'R2']) };
   await page.addInitScript(() => { window.EventSource = class { addEventListener() {} close() {} }; localStorage.setItem('scheduler:activity-visible:1', 'false'); });
@@ -53,6 +53,13 @@ async function fixture(t, preferences, options = {}) {
   await page.route('**/api/**', async route => {
     const request = route.request(), url = new URL(request.url()), method = request.method();
     url.pathname = url.pathname.replace(/^\/api/, '');
+    if (url.pathname === '/reports/section-schedule.xlsx') {
+      excelRequests.push(Object.fromEntries(url.searchParams));
+      await route.fulfill(failedExports
+        ? { status: 422, contentType: 'application/json', body: JSON.stringify({ detail: 'Simulated export failure' }) }
+        : { contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: Buffer.from('synthetic-xlsx-download') });
+      return;
+    }
     const data = method === 'GET' || method === 'OPTIONS' ? null : request.postDataJSON();
     let body = {}, status = 200;
     const list = catalogs;
@@ -103,7 +110,7 @@ async function fixture(t, preferences, options = {}) {
   await page.getByRole('button', { name: 'Split View', exact: true }).click();
   await page.getByRole('region', { name: 'right schedule' }).waitFor();
   t.after(() => assert.deepEqual(errors, [], 'No browser exceptions'));
-  return { page, context, moves, setFailedSave: value => { failedSaves = value; }, setFailedMove: value => { failedMoves = value; }, entries: () => entries, removeEntity: (kind, name) => { catalogs['/' + kind] = catalogs['/' + kind].filter(entity => entity.name !== name); },
+  return { page, context, moves, excelRequests, setFailedExport: value => { failedExports = value; }, setFailedSave: value => { failedSaves = value; }, setFailedMove: value => { failedMoves = value; }, entries: () => entries, removeEntity: (kind, name) => { catalogs['/' + kind] = catalogs['/' + kind].filter(entity => entity.name !== name); },
     left: page.getByRole('region', { name: 'left schedule' }), right: page.getByRole('region', { name: 'right schedule' }) };
 }
 
@@ -463,4 +470,59 @@ test('move notices expire or dismiss without removing Undo', async t => {
   assert.equal(await page.getByText('Class moved', { exact: true }).count(), 0);
   await page.keyboard.press('Control+z');
   await waitFor(page, () => document.querySelectorAll('[aria-label="left schedule"] .block[data-entry-id="1"]').length === 2);
+});
+
+
+test('Excel export selects sections or programs and preserves headings on failure', async t => {
+  const { page, left, right, excelRequests, setFailedExport } = await fixture(t);
+  await left.locator('select').selectOption('B');
+  await right.locator('select').selectOption('Grace');
+  await page.getByRole('button', { name: 'Export ▼', exact: true }).click();
+  await page.getByRole('button', { name: 'Export Section Schedule (Excel)', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Export Section Schedule (Excel)', exact: true });
+  await dialog.waitFor();
+  await dialog.getByLabel('Export scope', { exact: true }).selectOption('sections');
+  await dialog.getByLabel('School year', { exact: true }).fill('2026 - 2027');
+  await dialog.getByLabel('Report title', { exact: true }).fill('Schedule for review');
+  setFailedExport(true);
+  await dialog.getByRole('button', { name: 'Download Excel', exact: true }).click();
+  await dialog.getByRole('alert').waitFor();
+  assert.equal(await dialog.getByLabel('Report title', { exact: true }).inputValue(), 'Schedule for review');
+  assert.equal(excelRequests[0].scope, 'sections');
+  assert.equal(excelRequests[0].program_id, '1');
+  assert.equal(excelRequests[0].section_ids, '2');
+  setFailedExport(false);
+  const downloaded = page.waitForEvent('download');
+  await dialog.getByRole('button', { name: 'Download Excel', exact: true }).click();
+  assert.equal((await downloaded).suggestedFilename(), 'BSCS-section-schedules.xlsx');
+  await dialog.waitFor({ state: 'hidden' });
+  assert.equal(await left.locator('select').inputValue(), 'B');
+  assert.equal(await right.locator('select').inputValue(), 'Grace');
+  await page.getByRole('button', { name: 'Export ▼', exact: true }).click();
+  await page.getByRole('button', { name: 'Export Section Schedule (Excel)', exact: true }).click();
+  assert.equal(await dialog.getByLabel('Report title', { exact: true }).inputValue(), 'Schedule for review');
+  await dialog.getByLabel('Export scope', { exact: true }).selectOption('all');
+  const allDownloaded = page.waitForEvent('download');
+  await dialog.getByRole('button', { name: 'Download Excel', exact: true }).click();
+  assert.equal((await allDownloaded).suggestedFilename(), 'all-program-schedules.xlsx');
+  assert.equal(excelRequests.at(-1).scope, 'all');
+  assert.equal(excelRequests.at(-1).program_id, undefined);
+});
+
+test('read-only users can export a program and Escape closes the export dialog', async t => {
+  const { page, excelRequests } = await fixture(t, undefined, { readOnly: true });
+  const open = async () => {
+    await page.getByRole('button', { name: 'Export ▼', exact: true }).click();
+    await page.getByRole('button', { name: 'Export Section Schedule (Excel)', exact: true }).click();
+  };
+  await open();
+  const dialog = page.getByRole('dialog', { name: 'Export Section Schedule (Excel)', exact: true });
+  await dialog.waitFor();
+  await page.keyboard.press('Escape');
+  await dialog.waitFor({ state: 'hidden' });
+  await open();
+  const downloaded = page.waitForEvent('download');
+  await dialog.getByRole('button', { name: 'Download Excel', exact: true }).click();
+  await downloaded;
+  assert.equal(excelRequests[0].scope, 'program');
 });

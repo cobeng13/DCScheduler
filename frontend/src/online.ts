@@ -75,6 +75,35 @@ export async function downloadDatabaseBackup(): Promise<Blob> {
   return response.blob();
 }
 
+export type SectionScheduleOptions = {
+  scope: "sections" | "program" | "all";
+  sectionIds: number[];
+  schoolYear: string;
+  institution: string;
+  college: string;
+  title: string;
+};
+
+export async function downloadSectionSchedule(options: SectionScheduleOptions): Promise<Blob> {
+  if (!options.schoolYear.trim() || !options.title.trim()) throw new Error("Enter a school year and report title.");
+  if (options.scope !== "all" && !activeProgram) throw new Error("Select a program first.");
+  if (options.scope === "sections" && !options.sectionIds.length) throw new Error("Select at least one section.");
+  const query = new URLSearchParams({ scope: options.scope, school_year: options.schoolYear,
+    institution: options.institution, college: options.college, title: options.title });
+  if (options.scope !== "all") query.set("program_id", String(activeProgram!.id));
+  if (options.scope === "sections") options.sectionIds.forEach(id => query.append("section_ids", String(id)));
+  // All-program downloads must bypass the legacy transport's program scoping.
+  const response = await window.fetch(`/api/reports/section-schedule.xlsx?${query}`, {
+    headers: { "X-CSRF-Token": csrf }, credentials: "same-origin",
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    if (response.status === 401) window.dispatchEvent(new Event("scheduler-session-expired"));
+    throw new Error(errorMessage(body.detail));
+  }
+  return response.blob();
+}
+
 /** One collection keeps program timetables and shared room panes in sync. */
 export async function readSchedule<T extends { id: number; version?: number; program_id?: number }>() {
   const program = activeProgram;
