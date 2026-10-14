@@ -18,7 +18,7 @@ export function TimetablePane({ id, pane, split, active, capture, ready, scrollR
   return <section className={`schedule-pane ${split ? "split-pane" : ""} ${active ? "active-pane" : ""}`} aria-label={`${id} schedule`} onPointerDownCapture={onActivate} onFocusCapture={onActivate}>
     {split && !capture && <div className="pane-toolbar">
       <div className="pane-tabs" role="tablist" aria-label={`${id} timetable type`}>
-        {(["section", "faculty", "room"] as const).map(kind => <button key={kind} role="tab" aria-selected={pane.mode === `timetable-${kind}`} onClick={() => onMode(`timetable-${kind}`)}>{kind[0].toUpperCase() + kind.slice(1)}</button>)}
+        {(["section", "faculty", "room", "course"] as const).map(kind => <button key={kind} role="tab" aria-selected={pane.mode === `timetable-${kind}`} onClick={() => onMode(`timetable-${kind}`)}>{kind[0].toUpperCase() + kind.slice(1)}</button>)}
       </div>
       <button disabled={!canAdd} onClick={onAdd}>Add Class</button>
     </div>}

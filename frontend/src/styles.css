@@ -1115,6 +1115,11 @@ body {
   margin-bottom: 2px;
 }
 
+.course-meetings { padding: 12px; display: flex; flex-direction: column; gap: 6px; }
+.course-meetings button { text-align: left; padding: 8px 10px; border: 1px solid #cdd6e3; border-radius: 4px; background: #fff; color: #173e6d; }
+.course-meetings button:hover { background: #edf4ff; }
+.course-meetings button.conflict { border-color: #d33; background: #fff0f0; color: #a11; }
+
 .block-content {
   display: flex;
   flex-direction: column;

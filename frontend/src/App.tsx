@@ -1,3 +1,4 @@
+import { courseKey, courseOptions as buildCourseOptions, meetingLanes } from "./courses";
 import { parseCurriculumCsv, normalizeSemester, curriculumTerms, curriculumIdForSection, coursesForSection, coursePlotStatus } from "./curriculum";
 import type { Curriculum, CurriculumCourse, CurriculumState, CurriculumTerm } from "./curriculum";
 import { buildPastedClass, pasteTargetForCell } from "./paste";
@@ -64,7 +65,7 @@ type CourseDescriptionConflict = {
   entryIdsByDescription: Record<string, number[]>;
 };
 
-type ViewMode = "text" | "timetable-section" | "timetable-faculty" | "timetable-room";
+type ViewMode = "text" | TimetableMode;
 type EntityEditorKind = "section" | "faculty" | "room";
 
 type Selection = {
@@ -1139,6 +1140,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     () => activeProgram ? facultyOptions.filter(member => (facultyLoadHours[normalizeMatchValue(member.name)] ?? 0) > 0) : facultyOptions,
     [activeProgram, facultyOptions, facultyLoadHours]
   );
+  const courseOptions = useMemo(() => buildCourseOptions(entries), [entries]);
   const roomOptions = useMemo(() => sortEntities(rooms), [rooms]);
   const exportRoomOptions = useMemo(() => roomOptions.filter(room => !ruleExceptions.ignoreRoomIds.includes(room.id)),
     [roomOptions, ruleExceptions.ignoreRoomIds]);
@@ -1194,6 +1196,10 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
         setSelected: setSelectedFaculty,
       };
     }
+    if (viewMode === "timetable-course") {
+      return { label: "courses", entities: courseOptions, selected: activePane.course,
+        setSelected: (course: string) => updatePane(activePaneId, { course }) };
+    }
     if (viewMode === "timetable-room") {
       return {
         label: "rooms",
@@ -1213,6 +1219,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     sectionOptions,
     timetableFacultyOptions,
     roomOptions,
+    courseOptions, activePane.course, activePaneId,
     selectedSection,
     selectedFaculty,
     selectedRoom,
@@ -1730,7 +1737,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       let changed = false;
       for (const id of ["left", "right"] as const) {
         const pane = { ...prev[id] };
-        for (const [kind, options] of [["section", sectionOptions], ["faculty", timetableFacultyOptions], ["room", roomOptions]] as const) {
+        for (const [kind, options] of [["section", sectionOptions], ["faculty", timetableFacultyOptions], ["room", roomOptions], ["course", courseOptions]] as const) {
           if (!options.some(entity => entity.name === pane[kind])) {
             const name = options[0]?.name ?? "";
             if (pane[kind] !== name) { pane[kind] = name; changed = true; }
@@ -1740,7 +1747,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       }
       return changed ? next : prev;
     });
-  }, [scheduleLoaded, sectionOptions, timetableFacultyOptions, roomOptions]);
+  }, [scheduleLoaded, sectionOptions, timetableFacultyOptions, roomOptions, courseOptions]);
 
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
@@ -1857,6 +1864,12 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   const handleDragOver = (event: React.DragEvent, day: string, slot: number, paneId: PaneId) => {
     event.preventDefault();
     if (!dragging) return;
+    const pane = paneSettings[paneId];
+    if (pane.mode === "timetable-course" && courseKey(pane.course) !== courseKey(dragging.entry["Course Code"])) {
+      event.dataTransfer.dropEffect = "none";
+      setDragTarget(null);
+      return;
+    }
     setDragTarget({ day, startMinutes: slot, paneId });
   };
 
@@ -1931,6 +1944,9 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     activatePane(paneId);
     const assignment = assignmentForPane(destination);
     const { entry, day } = dragging;
+    if (assignment.kind === "course" && courseKey(assignment.name) !== courseKey(entry["Course Code"])) {
+      setDragging(null); setDragTarget(null); return;
+    }
     if (!assignment.name || dragTarget.startMinutes < 420 || dragTarget.startMinutes + dragging.duration > 1260) {
       setToast({ message: "Choose a destination and a time between 7 AM and 9 PM.", showRevert: false });
       setDragging(null); setDragTarget(null); return;
@@ -1940,7 +1956,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       const result = await requestJson(`${API_BASE}/schedule/${entry.id}/move`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ source_day: day, destination_day: dragTarget.day, start_minutes: dragTarget.startMinutes,
-          assignment: dragging.paneId !== paneId ? assignment : null, expected: entry }),
+          assignment: dragging.paneId !== paneId && assignment.kind !== "course" ? assignment : null, expected: entry }),
       });
       if (result.snapshot) {
         const snapshot: MoveSnapshot = { previousEntries: [entry], atomic: result.snapshot };
@@ -2081,6 +2097,8 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       Section: viewMode === "timetable-section" ? currentViewConfig.selected : "",
       Faculty: viewMode === "timetable-faculty" ? currentViewConfig.selected : "",
       Room: viewMode === "timetable-room" ? currentViewConfig.selected : "",
+      "Course Code": viewMode === "timetable-course" ? currentViewConfig.selected : "",
+      "Course Description": viewMode === "timetable-course" ? courseOptions.find(course => course.name === currentViewConfig.selected)?.description ?? "" : "",
       "Time (24 Hrs)": time24,
       "Time (LPU Std)": toLpuLabel(selectionRange.startMinutes, selectionRange.endMinutes),
       Days: selectionRange.day,
@@ -3321,7 +3339,8 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     const pane = paneSettings[id];
     const assignment = assignmentForPane(pane);
     const defaults = { ...buildEmptyScheduleForm({ Program: scheduleForm.Program }),
-      [assignment.kind === "section" ? "Section" : assignment.kind === "faculty" ? "Faculty" : "Room"]: assignment.name };
+      [assignment.kind === "section" ? "Section" : assignment.kind === "faculty" ? "Faculty" : assignment.kind === "course" ? "Course Code" : "Room"]: assignment.name };
+    if (assignment.kind === "course") defaults["Course Description"] = courseOptions.find(course => course.name === assignment.name)?.description ?? "";
     if (selectionPaneId === id && selectionRange) {
       defaults.Days = selectionRange.day;
       defaults["Time (LPU Std)"] = toLpuLabel(selectionRange.startMinutes, selectionRange.endMinutes);
@@ -3372,12 +3391,16 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     const pane = exportPane ?? paneSettings[id];
     const viewMode = pane.mode;
     const kind = paneField(viewMode);
-    const entities = kind === "section" ? sectionOptions : kind === "faculty" ? (capture ? facultyOptions : timetableFacultyOptions) : roomOptions;
+    const entities = kind === "section" ? sectionOptions : kind === "faculty" ? (capture ? facultyOptions : timetableFacultyOptions) : kind === "course" ? courseOptions : roomOptions;
     const effectiveSelection = pane[kind] || entities[0]?.name || "";
     const currentViewConfig = { selected: effectiveSelection, entities, label: kind, setSelected: (name: string) => { activatePane(id); updatePane(id, { [kind]: name }); } };
     const currentSectionBg = kind === "section" ? customizeSettings.sectionBgColors[effectiveSelection] : undefined;
-    const field = kind === "section" ? "Section" : kind === "faculty" ? "Faculty" : "Room";
-    const timetableEntries = (kind === "room" ? sharedEntries : entries).filter(entry => entry[field] === effectiveSelection);
+    const field = kind === "section" ? "Section" : kind === "faculty" ? "Faculty" : kind === "course" ? "Course Code" : "Room";
+    const timetableEntries = (kind === "room" ? sharedEntries : entries).filter(entry => kind === "course" ? courseKey(entry[field]) === courseKey(effectiveSelection) : entry[field] === effectiveSelection);
+    const courseLanes = new Map((kind === "course" ? visibleDays : []).map(day => [day, meetingLanes(timetableEntries.flatMap(entry => {
+      const time = parseTimeRange(entry["Time (24 Hrs)"]);
+      return time && splitDays(entry.Days).includes(day) ? [{ id: entry.id, ...time }] : [];
+    }))]));
     const paneSelectionRange = !capture && selectionPaneId === id ? selectionRange : null;
     const zoomPercent = pane.zoom;
     const rowHeight = `${40 * zoomPercent / 100}px`;
@@ -3388,7 +3411,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     const index = entities.findIndex(entity => entity.name === effectiveSelection);
     const prevEntity = () => currentViewConfig.setSelected(entities[(index - 1 + entities.length) % entities.length].name);
     const nextEntity = () => currentViewConfig.setSelected(entities[(index + 1) % entities.length].name);
-    const getTimetableEntityLabel = (name: string) => kind === "faculty" && name ? `${name} (${formatHoursLabel(facultyLoadHours[normalizeMatchValue(name)] ?? 0)} hrs)` : name;
+    const getTimetableEntityLabel = (name: string) => kind === "course" ? [name, courseOptions.find(course => course.name === name)?.description].filter(Boolean).join(" · ") : kind === "faculty" && name ? `${name} (${formatHoursLabel(facultyLoadHours[normalizeMatchValue(name)] ?? 0)} hrs)` : name;
     const scrollRef = capture ? captureTimetableRef : id === "left" ? leftTimetableRef : rightTimetableRef;
     return (
     <TimetablePane key={capture ? "capture" : id} id={id} pane={pane} split={splitMode} active={!capture && activePaneId === id} capture={capture} ready={entities.length > 0}
@@ -3407,6 +3430,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                     ◀
                   </button>
                   <select
+                    aria-label={`Select ${kind}`}
                     value={effectiveSelection}
                     onChange={(event) => currentViewConfig.setSelected(event.target.value)}
                     disabled={currentViewConfig.entities.length === 0}
@@ -3541,6 +3565,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                         .filter((day) => visibleDays.includes(day))
                         .map((day) => {
                           const column = visibleDays.indexOf(day) + 2;
+                          const lane = kind === "course" ? courseLanes.get(day)?.get(entry.id) : undefined;
                           const blockBg =
                             !conflictSet.has(entry.id) &&
                             customizeSettings.blockDisplay.useFacultyColors &&
@@ -3557,6 +3582,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                               style={{
                                 gridColumn: column,
                                 gridRow: `${startIndex + 1} / ${Math.max(endIndex, startIndex + 1) + 1}`,
+                                ...(lane && lane.count > 1 ? { boxSizing: "border-box" as const, width: `calc(${100 / lane.count}% - 4px)`, marginLeft: `calc(${lane.lane * 100 / lane.count}% + 2px)`, marginRight: 0 } : {}),
                                 backgroundColor: blockBg,
                                 color: textColor,
                               }}
@@ -3584,6 +3610,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                                   <div className="block-title">{entry["Course Code"]}</div>
                                 )}
                                 {viewMode !== "timetable-section" && <div>{entry.Section}</div>}
+                                {kind === "course" && !activeProgram && <div>{entry.Program}</div>}
                                 {customizeSettings.blockDisplay.showFaculty &&
                                   viewMode !== "timetable-faculty" && <div>{entry.Faculty}</div>}
                                 {customizeSettings.blockDisplay.showRoom &&
@@ -3617,6 +3644,12 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                   </div>
                 </>
               )}
+              {kind === "course" && <div className="course-meetings">
+                <strong>Meetings · {timetableEntries.length}</strong>
+                {timetableEntries.map(entry => <button key={entry.id} type="button" className={conflictSet.has(entry.id) ? "conflict" : ""} onClick={() => { if (!capture) { setSelectedEntryId(entry.id); enterEditMode(entry); } }}>
+                  {!activeProgram && `${entry.Program} · `}{entry.Section} · {formatDaysForDisplay(entry.Days)} · {entry["Time (LPU Std)"] || "TBA"} · {entry.Room || "TBA"} · {entry.Faculty || "TBA"}
+                </button>)}
+              </div>}
               {!capture && contextMenu && contextMenu.paneId === id && (
                 <div
                   className="context-menu"
@@ -4273,6 +4306,10 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
               type="button"
             >
               Timetable: Per Room
+            </button>
+            <button className={viewMode === "timetable-course" ? "active" : ""}
+              disabled={editorOpen || isSaving} onClick={() => setViewMode("timetable-course")} type="button">
+              Timetable: Per Course
             </button>
           </div>
         </div>

@@ -560,3 +560,67 @@ test('room Excel export supports room selection, failed drafts and read-only use
   await page.keyboard.press('Escape');
   await dialog.waitFor({ state: 'hidden' });
 });
+
+test('course panes group sections, show TBA, preserve selection and prefill additions', async t => {
+  const extraEntries = [
+    { ...initialEntries[0], id: 10, version: 1, program_id: 1, Section: 'B', 'Course Code': ' cs101 ', Days: 'M' },
+    { ...initialEntries[0], id: 11, version: 1, program_id: 1, Section: 'B', Days: 'TBA', 'Time (24 Hrs)': null, 'Time (LPU Std)': 'TBA' },
+    { ...initialEntries[0], id: 12, version: 1, program_id: 2, Program: 'OTHER', 'Course Code': 'FOREIGN' },
+  ];
+  const { page, left, right } = await fixture(t, undefined, { extraEntries });
+  await right.getByRole('tab', { name: 'Course', exact: true }).click();
+  assert.equal(await right.getByLabel('Select course').inputValue(), 'CS101');
+  assert.equal(await right.locator('.block').count(), 3);
+  assert.equal(await right.locator('.course-meetings button').count(), 3);
+  assert.match(await right.locator('.course-meetings').innerText(), /TBA/);
+  assert.equal(await right.locator('option[value="FOREIGN"]').count(), 0);
+  const blocks = await right.locator('.block').evaluateAll(nodes => nodes.map(node => ({ id: node.dataset.entryId, rect: node.getBoundingClientRect().toJSON() })));
+  const first = blocks.find(block => block.id === '1');
+  const second = blocks.find(block => block.id === '10');
+  assert.ok(first.rect.right <= second.rect.left || second.rect.right <= first.rect.left, 'Overlapping sections remain side by side');
+  if (process.env.SCHEDULER_TEST_SCREENSHOTS) await page.screenshot({ path: path.resolve(__dirname, '../../output/course-split-view.png') });
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export ▼', exact: true }).click();
+  await page.getByRole('button', { name: 'Export Timetable (Current View)', exact: true }).click();
+  assert.match((await downloadPromise).suggestedFilename(), /timetable_course_cs101\.png/);
+  await right.getByLabel('Select course').selectOption('CS202');
+  assert.equal(await left.getByLabel('Select section').inputValue(), 'A');
+  await page.reload();
+  await right.getByLabel('Select course').waitFor();
+  await waitFor(page, () => document.querySelector('[aria-label="right schedule"] [aria-label="Select course"]')?.value === 'CS202');
+  assert.equal(await right.getByLabel('Select course').inputValue(), 'CS202');
+  await right.getByRole('button', { name: 'Add Class', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Add Class', exact: true });
+  assert.equal(await dialog.getByLabel('Course Code', { exact: true }).inputValue(), 'CS202');
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.getByRole('button', { name: 'Single View', exact: true }).click();
+  assert.equal(await page.getByRole('button', { name: 'Timetable: Per Course', exact: true }).getAttribute('class'), 'active');
+  if (process.env.SCHEDULER_TEST_SCREENSHOTS) await page.screenshot({ path: path.resolve(__dirname, '../../output/course-view.png') });
+});
+
+test('moving into a course pane preserves the code and rejects mismatched courses', async t => {
+  const { page, left, right, moves } = await fixture(t);
+  await right.getByRole('tab', { name: 'Course', exact: true }).click();
+  await left.locator('.block').first().dragTo(right.locator('[data-day="T"][data-slot="480"]'));
+  await waitFor(page, () => document.querySelector('[data-entry-id="3"]'));
+  assert.equal(moves.length, 1);
+  assert.equal(moves[0].assignment, null);
+  await right.getByLabel('Select course').selectOption('CS202');
+  await left.locator('.block').first().dragTo(right.locator('[data-day="T"][data-slot="540"]'));
+  assert.equal(moves.length, 1);
+});
+
+test('all-program course view includes shared codes and remains read-only', async t => {
+  const { page } = await fixture(t, undefined, { extraEntries: [
+    { ...initialEntries[0], id: 20, version: 1, program_id: 2, Program: 'OTHER', Section: 'Other A' },
+  ] });
+  await page.getByRole('combobox', { name: 'Program', exact: true }).selectOption('');
+  await page.getByRole('button', { name: 'Timetable: Per Course', exact: true }).click();
+  const pane = page.getByRole('region', { name: 'left schedule' });
+  await pane.getByLabel('Select course').waitFor();
+  assert.equal(await pane.locator('.block').count(), 4);
+  assert.match(await pane.locator('.course-meetings').innerText(), /OTHER/);
+  assert.equal(await pane.locator('.block[draggable="true"]').count(), 0);
+  await pane.locator('.course-meetings button').first().click();
+  assert.equal(await page.getByRole('dialog', { name: 'Edit Class', exact: true }).count(), 0);
+});
