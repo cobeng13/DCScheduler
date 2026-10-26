@@ -481,7 +481,9 @@ test('Excel export selects sections or programs and preserves headings on failur
   await page.getByRole('button', { name: 'Export Section Schedule (Excel)', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'Export Section Schedule (Excel)', exact: true });
   await dialog.waitFor();
-  await dialog.getByLabel('Export scope', { exact: true }).selectOption('sections');
+  await dialog.getByRole('combobox', { name: 'Export scope', exact: true }).selectOption('sections');
+  await dialog.getByLabel('A', { exact: true }).uncheck();
+  await dialog.getByLabel('B', { exact: true }).check();
   await dialog.getByLabel('School year', { exact: true }).fill('2026 - 2027');
   await dialog.getByLabel('Report title', { exact: true }).fill('Schedule for review');
   setFailedExport(true);
@@ -501,8 +503,8 @@ test('Excel export selects sections or programs and preserves headings on failur
   await page.getByRole('button', { name: 'Export ▼', exact: true }).click();
   await page.getByRole('button', { name: 'Export Section Schedule (Excel)', exact: true }).click();
   assert.equal(await dialog.getByLabel('Report title', { exact: true }).inputValue(), 'Schedule for review');
-  await dialog.getByLabel('Export scope', { exact: true }).selectOption('all');
-  await dialog.getByLabel('Include room schedules (all programs, 30-minute rows)', { exact: true }).check();
+  await dialog.getByRole('combobox', { name: 'Export scope', exact: true }).selectOption('all');
+  await dialog.getByLabel('Include room schedules (all programs, 90-minute bands)', { exact: true }).check();
   const allDownloaded = page.waitForEvent('download');
   await dialog.getByRole('button', { name: 'Download Excel', exact: true }).click();
   assert.equal((await allDownloaded).suggestedFilename(), 'all-program-schedules.xlsx');
@@ -536,7 +538,7 @@ test('room Excel export supports room selection, failed drafts and read-only use
   const dialog = page.getByRole('dialog', { name: 'Export Room Schedule (Excel)', exact: true });
   await dialog.waitFor();
   assert.equal(await dialog.evaluate(element => element.contains(document.activeElement)), true);
-  await dialog.getByLabel('Rooms', { exact: true }).selectOption('selected');
+  await dialog.getByRole('combobox', { name: 'Rooms', exact: true }).selectOption('selected');
   assert.equal(await dialog.getByLabel('R2', { exact: true }).count(), 0);
   assert.equal(await dialog.getByLabel('R1', { exact: true }).isChecked(), true);
   await dialog.getByLabel('Report title', { exact: true }).fill('Room allocation');

@@ -63,7 +63,7 @@ export function SectionScheduleExport({ program, sections, selectedSection, onCl
           </select>
         </label>
         <label className="menu-checkbox"><input type="checkbox" checked={!!options.includeRooms}
-          onChange={event => field("includeRooms", event.target.checked)} />Include room schedules (all programs, 30-minute rows)</label>
+          onChange={event => field("includeRooms", event.target.checked)} />Include room schedules (all programs, 90-minute bands)</label>
         {options.includeRooms && <p className="modal-note">Rooms marked Ignore conflicts are excluded from the room worksheets.</p>}
         {options.scope === "sections" && <div>
           <label className="menu-checkbox"><input type="checkbox" checked={sections.length > 0 && options.sectionIds.length === sections.length}

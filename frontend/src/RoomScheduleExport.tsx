@@ -72,9 +72,11 @@ export function RoomScheduleExport({ rooms, onClose, onExported }: {
         <label className="modal-field">College<input maxLength={200} value={options.college} onChange={event => field("college", event.target.value)} /></label>
         <label className="modal-field">Report title<input required maxLength={200} value={options.title} onChange={event => field("title", event.target.value)} /></label>
       </fieldset>
-      <p className="modal-note">One worksheet per day, with rooms across columns and 30-minute rows from 7 AM to 9 PM.
+      <p className="modal-note">One ROOM overview with Monday/Wednesday, Tuesday/Thursday, and Friday/Saturday side by side,
+        using 90-minute display bands from 7 AM to 8:30 PM.
         Bookings from all programs are included; rooms marked Ignore conflicts are excluded. Earlier or later bookings extend the grid; Sunday is included when booked.
-        Exact times and faculty names are shown as stored. TBA entries are listed separately.</p>
+        Refer to exact meeting times: a band may be partly occupied. Meetings sharing a band are stacked;
+        only actual overlaps are highlighted. Faculty names are included. TBA entries are listed separately.</p>
       {error && <p className="error" role="alert">{error}</p>}
       <div className="modal-actions"><button type="button" disabled={busy} onClick={onClose}>Cancel</button>
         <button type="submit" disabled={busy || (options.roomIds !== null && !options.roomIds.length)}>{busy ? "Exporting…" : "Download Excel"}</button>

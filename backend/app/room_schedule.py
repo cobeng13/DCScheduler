@@ -1,4 +1,4 @@
-"""Daily room occupancy matrices using the scheduler's 30-minute time grid."""
+"""Secretary-style room overview with 90-minute display bands and exact times."""
 import io
 import math
 from copy import copy
@@ -8,10 +8,24 @@ from fastapi import HTTPException
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.pagebreak import Break
 
 from . import time_utils
 from .section_schedule import DEFAULT_COLLEGE, DEFAULT_INSTITUTION, DAYS, DAY_LABELS, natural, sheet_name, write_value, wrapped_height
+
+BAND_MINUTES = 90
+DAY_START = 420  # Anchor at 7 AM, rather than at midnight.
+DAY_END = 1230  # Nine bands, ending at 8:30 PM.
+MAX_CELLS = 250000
+MAX_COLUMNS = 16384
+ROOMS_PER_PAGE = 6
+
+
+def band_start(minute):
+    return max(0, DAY_START + (minute - DAY_START) // BAND_MINUTES * BAND_MINUTES)
+
+
+def band_end(minute):
+    return min(1440, DAY_START + math.ceil((minute - DAY_START) / BAND_MINUTES) * BAND_MINUTES)
 
 
 def clock(minutes):
@@ -48,23 +62,26 @@ def label(entry, start, end):
                       f'{clock(start)}–{clock(end)}', entry.get('Faculty') or 'TBA'])
 
 
-def configure_sheet(sheet, last_column):
+def configure_sheet(sheet, panel_width, title, school_year):
     sheet.sheet_view.showGridLines = False
     sheet.freeze_panes = 'B7'
     sheet.page_setup.orientation = 'landscape'
     sheet.page_setup.paperSize = '8'  # A3; room columns continue on additional pages.
     sheet.page_setup.scale = 80
     sheet.sheet_properties.pageSetUpPr.fitToPage = False
-    sheet.print_title_rows = '1:6'
+    # Each print area contains one day's header and at most six room columns.
+    # The left time column has the same bands at the same rows as the right panel.
     sheet.print_title_cols = 'A:A'
     sheet.page_margins.left = sheet.page_margins.right = 0.25
-    sheet.page_margins.top = sheet.page_margins.bottom = 0.25
-    sheet.column_dimensions['A'].width = 25
-    for column in range(2, last_column + 1):
-        sheet.column_dimensions[sheet.cell(6, column).column_letter].width = 25
-    # Keep readable text rather than shrink every room onto a single page.
-    for column in range(7, last_column, 6):
-        sheet.col_breaks.append(Break(id=column))
+    sheet.page_margins.top = 0.65
+    sheet.page_margins.bottom = 0.55
+    sheet.oddHeader.center.text = f'{title[:100]}\nSY {school_year}'.replace('&', '&&')
+    sheet.oddHeader.center.size = 10
+    sheet.oddFooter.left.text = 'Display bands only; refer to exact meeting times. Red = actual overlap.'
+    sheet.oddFooter.left.size = 9
+    sheet.oddFooter.right.text = 'Page &P of &N'
+    for column in range(1, panel_width * 2 + 1):
+        sheet.column_dimensions[get_column_letter(column)].width = 25
 
 
 def append_sheets(workbook, rooms, entries, school_year, institution=DEFAULT_INSTITUTION,
@@ -80,84 +97,118 @@ def append_sheets(workbook, rooms, entries, school_year, institution=DEFAULT_INS
             unplotted.append(entry)
         else:
             bookings.append((entry, *times, days))
-    start = min([420] + [start // 30 * 30 for _, start, _, _ in bookings])
-    end = max([1260] + [math.ceil(end / 30) * 30 for _, _, end, _ in bookings])
+    bookings.sort(key=lambda booking: (booking[1], booking[2], natural(booking[0].get('Course Code') or ''),
+                                       str(booking[0].get('id') or '')))
+    start = min([DAY_START] + [band_start(begin) for _, begin, _, _ in bookings])
+    end = max([DAY_END] + [band_end(finish) for _, _, finish, _ in bookings])
+    # Midnight clips the first/last band; the remaining boundaries stay 7 AM anchored.
+    boundaries = [start] + [minute for minute in range(DAY_START % BAND_MINUTES, 1441, BAND_MINUTES) if start < minute < end] + [end]
+    slots = list(zip(boundaries, boundaries[1:]))
     days = DAYS if include_sunday or any('Su' in item[3] for item in bookings) else DAYS[:-1]
-    if len(rooms) * ((end - start) // 30) * len(days) > 250000 or len(entries) > 50000:
+    panel_width = max(2, len(rooms) + 1)
+    if (panel_width * 2 > MAX_COLUMNS or panel_width * len(slots) * len(days) > MAX_CELLS
+            or len(entries) > 50000):
         raise HTTPException(413, 'This export is too large. Select fewer rooms.')
     edge = Side(style='thin', color='B8C4D2')
     border = Border(left=edge, right=edge, top=edge, bottom=edge)
-    slots = list(range(start, end, 30))
     occupied = defaultdict(list)
     occupancy_count = 0
     for index, (entry, begin, finish, booked_days) in enumerate(bookings):
-        occupancy_count += len(booked_days) * (math.ceil(finish / 30) - begin // 30)
-        if occupancy_count > 250000:
+        touched = [offset for offset, (left, right) in enumerate(slots) if begin < right and finish > left]
+        occupancy_count += len(booked_days) * len(touched)
+        if occupancy_count > MAX_CELLS:
             raise HTTPException(413, 'This export has too many bookings. Select fewer rooms.')
         for day in booked_days:
-            for minute in range(begin // 30 * 30, math.ceil(finish / 30) * 30, 30):
-                occupied[day, entry['room_id'], minute].append(index)
-    last_column = max(2, len(rooms) + 1)
-    for day in days:
-        sheet = workbook.create_sheet(sheet_name(f'ROOM {DAY_LABELS[day]}', used))
-        configure_sheet(sheet, last_column)
-        for row, value in [(1, institution), (2, college), (3, f'{title} — {DAY_LABELS[day]}'),
-                           (4, f'SY {school_year} • All programs • 30-minute rows'),
-                           (5, 'Exact times are shown. Red = overlapping room bookings. TBA entries are listed separately.')]:
-            sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=last_column)
-            cell = write_value(sheet, row, 1, value)
-            cell.font = Font(name='Arial Narrow', size=12 if row != 5 else 10, bold=row != 5)
-            cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
-            sheet.row_dimensions[row].height = 24 if row != 5 else 30
-        for column, value in enumerate(['Time'] + [room['name'] for room in rooms], 1):
-            cell = write_value(sheet, 6, column, value)
-            cell.font = Font(name='Arial Narrow', size=11, bold=True)
-            cell.fill = PatternFill('solid', fgColor='DCE6F1')
-            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-            cell.border = border
-        sheet.row_dimensions[6].height = 30
-        for offset, minute in enumerate(slots, 7):
-            sheet.row_dimensions[offset].height = 30
-            cell = write_value(sheet, offset, 1, f'{clock(minute)}–{clock(minute + 30)}')
-            cell.font = Font(name='Arial Narrow', size=10)
-            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-            cell.fill = PatternFill('solid', fgColor='F2F5F8')
-            cell.border = border
-            for column in range(2, last_column + 1):
-                sheet.cell(offset, column).border = border
-        for column, room in enumerate(rooms, 2):
-            offset = 0
-            while offset < len(slots):
-                indexes = tuple(occupied[day, room['id'], slots[offset]])
-                if not indexes:
-                    offset += 1
-                    continue
-                until = offset + 1
-                while until < len(slots) and tuple(occupied[day, room['id'], slots[until]]) == indexes:
-                    until += 1
-                selected = [bookings[index] for index in indexes]
-                overlap = any(time_utils.overlap(a[1], a[2], b[1], b[2])
-                              for index, a in enumerate(selected) for b in selected[index + 1:])
-                text = '\n\n'.join(label(entry, begin, finish) for entry, begin, finish, _ in selected)
-                if len(text) > 32767:
-                    raise HTTPException(413, f'{room["name"]}: too many bookings in one time block to export safely.')
-                first, last = offset + 7, until + 6
-                cell = write_value(sheet, first, column, text)
+            for offset in touched:
+                occupied[day, entry['room_id'], offset].append(index)
+    conflicts = {}
+    for key, indexes in occupied.items():
+        left, right = slots[key[2]]
+        latest_end = left
+        conflicts[key] = False
+        for index in indexes:  # Bookings are in start-time order.
+            _, begin, finish, _ = bookings[index]
+            if max(left, begin) < latest_end:
+                conflicts[key] = True
+                break
+            latest_end = min(right, finish)
+
+    sheet = workbook.create_sheet(sheet_name('ROOM', used))
+    configure_sheet(sheet, panel_width, title, school_year)
+    for row, value in [(1, institution), (2, college), (3, title),
+                       (4, f'SY {school_year} • All programs • 90-minute display bands'),
+                       (5, 'Refer to exact meeting times: a band may be partly occupied. Red = actual overlap. TBA entries are listed separately.')]:
+        sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=panel_width * 2)
+        cell = write_value(sheet, row, 1, value)
+        cell.font = Font(name='Arial Narrow', size=12 if row != 5 else 10, bold=row != 5)
+        cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+        sheet.row_dimensions[row].height = wrapped_height([value], [panel_width * 2 * 25])
+
+    print_areas = []
+    panels = [('M', 'W'), ('T', 'Th'), ('F', 'Sa')]
+    if 'Su' in days:
+        panels.append(('Su',))
+    for pair_index, pair in enumerate(panels):
+        header = 6 + pair_index * (len(slots) + 2)
+        for side, day in enumerate(pair):
+            time_column = 1 + side * panel_width
+            for column, value in enumerate(['Time'] + [f'{DAY_LABELS[day]}\n{room["name"]}' for room in rooms], time_column):
+                cell = write_value(sheet, header, column, value)
+                cell.font = Font(name='Arial Narrow', size=11, bold=True)
+                cell.fill = PatternFill('solid', fgColor='DCE6F1')
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                cell.border = border
+            sheet.row_dimensions[header].height = 36
+            for row, (left, right) in enumerate(slots, header + 1):
+                sheet.row_dimensions[row].height = max(sheet.row_dimensions[row].height or 0, 48)
+                cell = write_value(sheet, row, time_column, f'{clock(left)}–{clock(right)}')
                 cell.font = Font(name='Arial Narrow', size=10)
                 cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-                cell.fill = PatternFill('solid', fgColor='FCE4D6' if overlap else 'DCE6F1')
+                cell.fill = PatternFill('solid', fgColor='F2F5F8')
                 cell.border = border
-                # Short or stacked classes need enough height to retain every label.
-                height = wrapped_height([text], [25]) / (until - offset)
-                for row in range(first, last + 1):
-                    sheet.row_dimensions[row].height = max(sheet.row_dimensions[row].height, height)
-                    sheet.cell(row, column).fill = copy(cell.fill)
-                if first != last:
-                    sheet.merge_cells(start_row=first, start_column=column, end_row=last, end_column=column)
-                offset = until
-        if not rooms:
-            write_value(sheet, 7, 2, 'No rooms to export.')
-        sheet.print_area = f'A1:{get_column_letter(last_column)}{6 + len(slots)}'
+                for column in range(time_column + 1, time_column + panel_width):
+                    sheet.cell(row, column).border = border
+            for column, room in enumerate(rooms, time_column + 1):
+                offset = 0
+                while offset < len(slots):
+                    indexes = tuple(occupied[day, room['id'], offset])
+                    if not indexes:
+                        offset += 1
+                        continue
+                    until = offset + 1
+                    overlap = conflicts[day, room['id'], offset]
+                    while (until < len(slots) and tuple(occupied[day, room['id'], until]) == indexes
+                           and conflicts[day, room['id'], until] == overlap):
+                        until += 1
+                    selected = [bookings[index] for index in indexes]
+                    text = '\n\n'.join(label(entry, begin, finish) for entry, begin, finish, _ in selected)
+                    if len(text) > 32767:
+                        raise HTTPException(413, f'{room["name"]}: too many bookings in one time block to export safely.')
+                    first, last = header + 1 + offset, header + until
+                    cell = write_value(sheet, first, column, text)
+                    cell.font = Font(name='Arial Narrow', size=10)
+                    cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                    cell.fill = PatternFill('solid', fgColor='FCE4D6' if overlap else 'DCE6F1')
+                    cell.border = border
+                    # Short or stacked classes need enough height to retain every label.
+                    height = wrapped_height([text], [25]) / (until - offset)
+                    if height > 409:
+                        raise HTTPException(413, f'{room["name"]}: too many booking details in one band to fit in Excel.')
+                    for row in range(first, last + 1):
+                        sheet.row_dimensions[row].height = max(sheet.row_dimensions[row].height, height)
+                        sheet.cell(row, column).fill = copy(cell.fill)
+                    if first != last:
+                        sheet.merge_cells(start_row=first, start_column=column, end_row=last, end_column=column)
+                    offset = until
+            if not rooms:
+                write_value(sheet, header, time_column + 1, DAY_LABELS[day])
+                write_value(sheet, header + 1, time_column + 1, 'No rooms to export.')
+            for chunk in range(0, max(1, len(rooms)), ROOMS_PER_PAGE):
+                first_column = time_column + 1 + chunk
+                last_column = time_column + min(chunk + ROOMS_PER_PAGE, panel_width - 1)
+                print_areas.append(f'{get_column_letter(first_column)}{header}:'
+                                   f'{get_column_letter(last_column)}{header + len(slots)}')
+    sheet.print_area = print_areas
     if unplotted:
         sheet = workbook.create_sheet(sheet_name('Room TBA', used))
         headers = ['Course Code', 'Section', 'Program', 'Time', 'Days', 'Room', 'Faculty', 'Reason']
