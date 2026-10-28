@@ -64,13 +64,14 @@ async function fixture(t, preferences, options = {}) {
     let body = {}, status = 200;
     const list = catalogs;
     if (method === 'OPTIONS') body = {};
-    else if (url.pathname === '/auth/me') body = { user: { id: 1, username: 'alpha', is_admin: false, disabled: false, must_change_password: false }, csrf_token: 'synthetic-token' };
-    else if (url.pathname === '/programs') body = [{ id: 1, name: 'BSCS', assigned_user_id: options.readOnly ? 99 : 1, version: 1 }];
+    else if (url.pathname === '/auth/me') body = { user: { id: 1, username: 'alpha', is_admin: options.isAdmin ?? false, disabled: false, must_change_password: false }, csrf_token: 'synthetic-token' };
+    else if (url.pathname === '/programs') body = [{ id: 1, name: 'BSCS', assigned_user_id: options.readOnly ? 99 : 1, version: 1 }, ...(options.extraPrograms ?? [])];
     else if (['/activity', '/activity/actors', '/presence'].includes(url.pathname)) body = [];
     else if (url.pathname === '/presence/heartbeat') body = { ok: true };
     else if (url.pathname === '/rules') body = { rules: { ignoreRoom: false, ignoreFaculty: false, ignoreRoomIds: options.ignoredRoomIds ?? [], ignoreFacultyIds: [] }, version: 1 };
     else if (url.pathname === '/settings') body = { version: 1, settings: { curriculumState: { curricula: [], selectedTerm: 'First Semester', sectionYearLevels: {}, yearLevelCurriculumIds: {} } } };
     else if (url.pathname === '/conflicts') body = { conflicts: options.conflicts ?? [] };
+    else if (url.pathname === '/sections' && options.sectionsByProgram?.[url.searchParams.get('program_id')]) body = options.sectionsByProgram[url.searchParams.get('program_id')];
     else if (list[url.pathname]) body = list[url.pathname];
     else if (url.pathname.endsWith('/move-check')) body = { ok: true };
     else if (url.pathname.endsWith('/move/revert')) { entries = clone(snapshots.get(data.move_activity_id)); body = { entries }; }
@@ -398,6 +399,53 @@ test('shared room panes include other programs but block their edits and drags',
   await foreign.click({ button: 'right' });
   assert.ok(await right.getByRole('button', { name: 'Edit', exact: true }).isDisabled());
   assert.ok(await right.getByRole('button', { name: 'Delete', exact: true }).isDisabled());
+  assert.equal(moves.length, 0);
+});
+
+test('administrators drag shared-room bookings from another program and Undo preserves ownership', async t => {
+  const other = { ...initialEntries[1], id: 10, Program: 'OTHER', program_id: 2, section_id: 3, version: 1, Section: 'Other section', Room: 'R1', Days: 'T' };
+  const { page, right, moves, entries } = await fixture(t, undefined, { isAdmin: true, extraEntries: [other], extraPrograms: [{ id: 2, name: 'OTHER', assigned_user_id: 99, version: 1 }] });
+  await right.getByRole('tab', { name: 'Room', exact: true }).click();
+  const block = right.locator('[data-entry-id="10"]');
+  assert.equal(await block.getAttribute('draggable'), 'true');
+  await block.dragTo(right.locator('[data-day="W"][data-slot="480"]'));
+  await page.getByText('Class moved', { exact: true }).waitFor();
+  assert.equal(moves[0].expected.program_id, 2);
+  assert.equal(moves[0].assignment, null);
+  assert.equal(entries().find(entry => entry.id === 10).Program, 'OTHER');
+  assert.equal(entries().find(entry => entry.id === 10).Days, 'W');
+  await page.getByRole('button', { name: 'Edit ▼', exact: true }).click();
+  await page.getByRole('button', { name: /^Undo/ }).click();
+  await waitFor(page, () => document.querySelector('[aria-label="right schedule"] [data-entry-id="10"]')?.getAttribute('aria-label').endsWith(', T'));
+  assert.equal(entries().find(entry => entry.id === 10).program_id, 2);
+});
+
+for (const singleView of [false, true]) test(`administrators open shared-room edits in the owning program in ${singleView ? 'single' : 'split'} view`, async t => {
+  const other = { ...initialEntries[1], id: 10, Program: 'OTHER', program_id: 2, section_id: 3, version: 1, 'Course Description': 'Other program course', Units: 2, Room: 'R1', Days: 'T' };
+  const { page, right, entries } = await fixture(t, undefined, { isAdmin: true, extraEntries: [other], extraPrograms: [{ id: 2, name: 'OTHER', assigned_user_id: 99, version: 1 }], sectionsByProgram: { 2: [{ id: 3, name: 'B', program_id: 2 }] } });
+  await right.getByRole('tab', { name: 'Room', exact: true }).click();
+  if (singleView) await page.getByRole('button', { name: 'Single View', exact: true }).click();
+  await right.locator('[data-entry-id="10"]').click();
+  const dialog = singleView ? page.locator('.content > aside.panel.editing') : page.getByRole('dialog', { name: 'Edit Class', exact: true });
+  await dialog.waitFor();
+  assert.equal(await page.getByRole('combobox', { name: 'Program', exact: true }).inputValue(), '2');
+  assert.equal(await dialog.getByLabel('Program', { exact: true }).inputValue(), 'OTHER');
+  assert.equal(await dialog.getByLabel('Course Description', { exact: true }).inputValue(), 'Other program course');
+  assert.equal(await dialog.getByLabel('Units', { exact: true }).inputValue(), '2');
+  assert.equal(await right.getByLabel('Select room').inputValue(), 'R1');
+  await dialog.getByLabel('Faculty', { exact: true }).fill('Ada');
+  await dialog.getByRole('button', { name: singleView ? 'Save Changes to Selected Class' : 'Save', exact: true }).click();
+  await dialog.waitFor({ state: 'hidden' });
+  assert.equal(entries().find(entry => entry.id === 10).Faculty, 'Ada');
+  assert.equal(entries().find(entry => entry.id === 10).program_id, 2);
+  assert.deepEqual(entries().find(entry => entry.id === 2), { ...initialEntries[1], version: 1, program_id: 1, section_id: 2 });
+});
+
+test('administrators cannot reassign another program booking into the selected program section', async t => {
+  const other = { ...initialEntries[1], id: 10, Program: 'OTHER', program_id: 2, section_id: 3, version: 1, Section: 'A', Room: 'R1', Days: 'T' };
+  const { right, left, moves } = await fixture(t, undefined, { isAdmin: true, extraEntries: [other] });
+  await right.getByRole('tab', { name: 'Room', exact: true }).click();
+  await right.locator('[data-entry-id="10"]').dragTo(left.locator('[data-day="W"][data-slot="480"]'));
   assert.equal(moves.length, 0);
 });
 

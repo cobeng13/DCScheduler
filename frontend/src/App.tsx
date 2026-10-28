@@ -10,7 +10,9 @@ import { ClassEditor } from "./ClassEditor";
 import { TimetablePane } from "./TimetablePane";
 import { SectionScheduleExport } from "./SectionScheduleExport";
 import { RoomScheduleExport } from "./RoomScheduleExport";
-import { assignmentForPane, linkedScrollTop, loadPaneSettings, paneField, type PaneId, type PaneState, type TimetableMode } from "./panes";
+import { assignmentForPane, linkedScrollTop, loadPaneSettings, paneField, type PaneId, type PaneState, type PaneSettings, type TimetableMode } from "./panes";
+
+export type SharedRoomEdit = { entryId: number; panes: PaneSettings };
 
 type ScheduleEntry = {
   id: number;
@@ -529,15 +531,22 @@ const normalizeDays = (value: string) => {
   return canonical.join(",");
 };
 
-export default function App({ readOnly = false, activeProgram = "", isAdmin = false }: { readOnly?: boolean; activeProgram?: string; isAdmin?: boolean }) {
+export default function App({ readOnly = false, activeProgram = "", activeProgramId, isAdmin = false, sharedRoomEdit, onEditSharedRoom }: {
+  readOnly?: boolean; activeProgram?: string; activeProgramId?: number; isAdmin?: boolean;
+  sharedRoomEdit?: SharedRoomEdit;
+  onEditSharedRoom?: (programId: number, edit: SharedRoomEdit) => void;
+}) {
   const [entries, setEntries] = useState<ScheduleEntry[]>([]);
   const [sections, setSections] = useState<NamedEntity[]>([]);
   const [faculty, setFaculty] = useState<NamedEntity[]>([]);
   const [rooms, setRooms] = useState<NamedEntity[]>([]);
   const [conflicts, setConflicts] = useState<ConflictReport>({ conflicts: [] });
-  const canEditEntry = (entry: ScheduleEntry) => !readOnly && entry.Program === activeProgram;
+  const belongsToActiveProgram = (entry: ScheduleEntry) => activeProgramId !== undefined ? entry.program_id === activeProgramId : entry.Program === activeProgram;
+  const canEditEntry = (entry: ScheduleEntry) => !readOnly && belongsToActiveProgram(entry);
+  const canInteractWithEntry = (entry: ScheduleEntry) => !readOnly && (isAdmin || belongsToActiveProgram(entry));
   const [sharedEntries, setSharedEntries] = useState<ScheduleEntry[]>([]);
-  const [paneSettings, setPaneSettings] = useState(() => loadPaneSettings(localStorage));
+  const [paneSettings, setPaneSettings] = useState(() => sharedRoomEdit?.panes ?? loadPaneSettings(localStorage));
+  const sharedRoomEditOpened = useRef(false);
   const [isTextView, setIsTextView] = useState(false);
   const [viewportWidth, setViewportWidth] = useState(window.innerWidth);
   const [workspaceWidth, setWorkspaceWidth] = useState(window.innerWidth);
@@ -1850,7 +1859,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   };
 
   const handleDragStart = (entry: ScheduleEntry, day: string, paneId: PaneId) => {
-    if (!canEditEntry(entry) || isSaving || editorOpen || isExporting) return;
+    if (!canInteractWithEntry(entry) || isSaving || editorOpen || isExporting) return;
     activatePane(paneId);
     const parsed = parseTimeRange(entry["Time (24 Hrs)"]);
     if (!parsed) return;
@@ -1865,6 +1874,11 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
     event.preventDefault();
     if (!dragging) return;
     const pane = paneSettings[paneId];
+    if (pane.mode === "timetable-section" && !belongsToActiveProgram(dragging.entry)) {
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "none";
+      setDragTarget(null);
+      return;
+    }
     if (pane.mode === "timetable-course" && courseKey(pane.course) !== courseKey(dragging.entry["Course Code"])) {
       event.dataTransfer.dropEffect = "none";
       setDragTarget(null);
@@ -1939,11 +1953,14 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   };
 
   const handleDrop = async (paneId: PaneId) => {
-    if (!dragging || !canEditEntry(dragging.entry) || !dragTarget || dragTarget.paneId !== paneId || isSaving) return;
+    if (!dragging || !canInteractWithEntry(dragging.entry) || !dragTarget || dragTarget.paneId !== paneId || isSaving) return;
     const destination = paneSettings[paneId];
     activatePane(paneId);
     const assignment = assignmentForPane(destination);
     const { entry, day } = dragging;
+    if (assignment.kind === "section" && !belongsToActiveProgram(entry)) {
+      setDragging(null); setDragTarget(null); return;
+    }
     if (assignment.kind === "course" && courseKey(assignment.name) !== courseKey(entry["Course Code"])) {
       setDragging(null); setDragTarget(null); return;
     }
@@ -2269,7 +2286,12 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
   };
 
   const enterEditMode = (entry: ScheduleEntry) => {
-    if (!canEditEntry(entry)) return;
+    if (!canInteractWithEntry(entry) || isSaving) return;
+    if (!belongsToActiveProgram(entry)) {
+      // Load the owning program's curriculum and sections before editing.
+      if (entry.program_id !== undefined) onEditSharedRoom?.(entry.program_id, { entryId: entry.id, panes: paneSettings });
+      return;
+    }
     pinVersion("schedule", entry.id, entry.version);
     if (isSaving) return;
     editorBaseline.current = draftFingerprint(entry);
@@ -2286,6 +2308,14 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
       }, 150);
     }
   };
+
+  useEffect(() => {
+    if (!sharedRoomEdit || sharedRoomEditOpened.current || !scheduleLoaded || !settingsLoaded) return;
+    const entry = entries.find(item => item.id === sharedRoomEdit.entryId);
+    if (!entry) return;
+    sharedRoomEditOpened.current = true;
+    enterEditMode(entry);
+  }, [sharedRoomEdit, scheduleLoaded, settingsLoaded, entries]);
 
   const cancelEditMode = () => {
     if (isSaving) return;
@@ -3598,11 +3628,11 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                                 backgroundColor: blockBg,
                                 color: textColor,
                               }}
-                              draggable={!capture && canEditEntry(entry) && !isSaving && !editorOpen && !isExporting}
+                              draggable={!capture && canInteractWithEntry(entry) && !isSaving && !editorOpen && !isExporting}
                               tabIndex={capture ? undefined : 0}
                               role="button"
                               data-entry-id={entry.id}
-                              aria-label={`${canEditEntry(entry) ? "Edit" : "View"} ${entry["Course Code"]}, ${entry.Section}, ${day}`}
+                              aria-label={`${canInteractWithEntry(entry) ? "Edit" : "View"} ${entry["Course Code"]}, ${entry.Section}, ${day}`}
                               onKeyDown={event => { if (!capture && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); setSelectedEntryId(entry.id); enterEditMode(entry); } }}
                               onDragStart={() => handleDragStart(entry, day, id)}
                               onDragOver={event => {
@@ -3680,7 +3710,7 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                   className="block-menu"
                   style={{ top: blockMenu.y, left: blockMenu.x }}
                 >
-                  <button onClick={() => enterEditMode(blockMenu.entry)} disabled={isSaving || !canEditEntry(blockMenu.entry)}>
+                  <button onClick={() => enterEditMode(blockMenu.entry)} disabled={isSaving || !canInteractWithEntry(blockMenu.entry)}>
                     Edit
                   </button>
                   <button onClick={copyBlock} disabled={isSaving}>

@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useState } from "react";
-import App from "./App";
+import App, { type SharedRoomEdit } from "./App";
 import { Activity, configure, downloadDatabaseBackup, OnlineUser, Program, request } from "./online";
 import "./online.css";
 
@@ -12,6 +12,7 @@ export default function OnlineApp() {
   const [loading, setLoading] = useState(true);
   const [programs, setPrograms] = useState<Program[]>([]);
   const [programId, setProgramId] = useState<number | null>(null);
+  const [sharedRoomEdit, setSharedRoomEdit] = useState<(SharedRoomEdit & { programId: number }) | undefined>();
   const [online, setOnline] = useState<{ id: number; username: string }[]>([]);
   const [actors, setActors] = useState<{ id: number; username: string }[]>([]);
   const [feed, setFeed] = useState<Activity[]>([]);
@@ -55,7 +56,7 @@ export default function OnlineApp() {
     setFeed(current => older ? [...current, ...events] : events);
     setActors(people);
   };
-  const signOut = () => { setSession(null); setPrograms([]); setProgramId(null); setFeed([]); configure(null, "", null); };
+  const signOut = () => { setSession(null); setPrograms([]); setProgramId(null); setSharedRoomEdit(undefined); setFeed([]); configure(null, "", null); };
   useEffect(() => {
     request<Session>("/auth/me").then(setSession).catch(() => {}).finally(() => setLoading(false));
     const openAdmin = () => setAdminOpen(true);
@@ -122,7 +123,7 @@ export default function OnlineApp() {
   return <>
     <header className="online-header">
       <strong>CAMP Scheduler</strong>
-      <label>Program <select value={programId ?? ""} onChange={e => setProgramId(e.target.value ? Number(e.target.value) : null)}>
+      <label>Program <select value={programId ?? ""} onChange={e => { setSharedRoomEdit(undefined); setProgramId(e.target.value ? Number(e.target.value) : null); }}>
         <option value="">All programs · view only</option>
         {programs.map(p => <option key={p.id} value={p.id}>{p.name}{p.assigned_user_id === session.user.id ? " · yours" : ""}</option>)}
       </select></label>
@@ -140,7 +141,13 @@ export default function OnlineApp() {
     {session.user.is_admin && adminOpen && <AdminPanel programs={programs} reload={loadPrograms} onError={setError} />}
     <div className={`online-layout${activityVisible ? "" : " activity-hidden"}`}>
       <div className="scheduler-workspace">
-        {programs.length ? <App key={programId ?? "all"} readOnly={!canEdit} activeProgram={active?.name ?? ""} isAdmin={session.user.is_admin} /> : <div className="account-card">Create programs and accounts in Administration to begin.</div>}
+        {programs.length ? <App key={programId ?? "all"} readOnly={!canEdit} activeProgram={active?.name ?? ""} activeProgramId={active?.id} isAdmin={session.user.is_admin}
+          sharedRoomEdit={sharedRoomEdit?.programId === programId ? sharedRoomEdit : undefined}
+          onEditSharedRoom={(ownerId, edit) => {
+            if (!session.user.is_admin || !programs.some(program => program.id === ownerId)) return;
+            setSharedRoomEdit({ ...edit, programId: ownerId });
+            setProgramId(ownerId);
+          }} /> : <div className="account-card">Create programs and accounts in Administration to begin.</div>}
       </div>
       <aside id="shared-activity" className="activity-panel" hidden={!activityVisible}>
         <h2>Shared activity</h2>
