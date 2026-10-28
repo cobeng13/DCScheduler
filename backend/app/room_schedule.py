@@ -112,9 +112,13 @@ def append_sheets(workbook, rooms, entries, school_year, institution=DEFAULT_INS
     edge = Side(style='thin', color='B8C4D2')
     border = Border(left=edge, right=edge, top=edge, bottom=edge)
     occupied = defaultdict(list)
+    preferred = {}
     occupancy_count = 0
     for index, (entry, begin, finish, booked_days) in enumerate(bookings):
         touched = [offset for offset, (left, right) in enumerate(slots) if begin < right and finish > left]
+        # Reserve each meeting's largest band so compaction can never hide it.
+        # max() keeps the earlier band when the occupied minutes are equal.
+        preferred[index] = max(touched, key=lambda offset: min(finish, slots[offset][1]) - max(begin, slots[offset][0]))
         occupancy_count += len(booked_days) * len(touched)
         if occupancy_count > MAX_CELLS:
             raise HTTPException(413, 'This export has too many bookings. Select fewer rooms.')
@@ -133,11 +137,27 @@ def append_sheets(workbook, rooms, entries, school_year, institution=DEFAULT_INS
                 break
             latest_end = min(right, finish)
 
+    for key, indexes in occupied.items():
+        if conflicts[key]:
+            continue
+        left, right = slots[key[2]]
+        minutes = {index: min(bookings[index][2], right) - max(bookings[index][1], left) for index in indexes}
+        # Omit minor leading/trailing fragments, including in otherwise empty
+        # bands. Always keep a meeting's reserved band so short classes survive.
+        selected = [index for index in indexes if preferred[index] == key[2]
+                    or 2 * minutes[index] > right - left]
+        winner = max(indexes, key=lambda index: minutes[index])
+        # A shared 45/45 boundary goes to the earlier meeting. An isolated
+        # exactly-half fragment is omitted unless it is the reserved band.
+        if not selected and len(indexes) > 1 and 2 * minutes[winner] == right - left:
+            selected = [winner]
+        occupied[key] = selected
+
     sheet = workbook.create_sheet(sheet_name('ROOM', used))
     configure_sheet(sheet, panel_width, title, school_year)
     for row, value in [(1, institution), (2, college), (3, title),
                        (4, f'SY {school_year} • All programs • 90-minute display bands'),
-                       (5, 'Refer to exact meeting times: a band may be partly occupied. Red = actual overlap. TBA entries are listed separately.')]:
+                       (5, 'Shared bands favor the longest occupant; exact times apply. Red = actual overlap. TBA entries are listed separately.')]:
         sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=panel_width * 2)
         cell = write_value(sheet, row, 1, value)
         cell.font = Font(name='Arial Narrow', size=12 if row != 5 else 10, bold=row != 5)

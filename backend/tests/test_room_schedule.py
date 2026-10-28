@@ -40,9 +40,9 @@ def test_overview_pairs_days_in_ninety_minute_bands_and_keeps_exact_times():
     assert [cell.value for cell in mon[6]] == ['Time', 'MON\nR1', 'MON\nR2', 'Time', 'WED\nR1', 'WED\nR2']
     assert mon.max_row == 37
     assert mon['A7'].value == '7:00 AM–8:30 AM' and mon['A15'].value == '7:00 PM–8:30 PM'
-    assert 'B7:B8' in set(map(str, mon.merged_cells.ranges))
-    assert mon['B7'].value == 'C101\nA (P1)\n8:00 AM–9:30 AM\nF1'
-    assert mon['E7'].value == mon['B7'].value
+    assert mon['B7'].value is None
+    assert mon['B8'].value == 'C101\nA (P1)\n8:00 AM–9:30 AM\nF1'
+    assert mon['E8'].value == mon['B8'].value
     assert [mon.cell(row, 2).value for row in (17, 28)] == ['TUE\nR1', 'FRI\nR1']
     assert [mon.cell(row, 5).value for row in (17, 28)] == ['THU\nR1', 'SAT\nR1']
     assert not any('C101' in str(cell.value) for row in mon.iter_rows(min_row=17) for cell in row)
@@ -89,24 +89,72 @@ def test_quarter_hour_meetings_are_preserved_without_false_conflict():
     assert 'Room TBA' not in book.sheetnames
 
 
-def test_shared_band_stacks_back_to_back_classes_without_merging_or_conflict():
-    sheet = build([entry(**{'Days': 'M', 'Time (24 Hrs)': '10:30-12:00'}),
-                   entry(id=2, **{'Days': 'M', 'Course Code': 'NEXT', 'Time (24 Hrs)': '12:00-13:30'})])['ROOM']
-    assert 'C101' in sheet['B9'].value and 'NEXT' not in sheet['B9'].value
-    assert 'C101' in sheet['B10'].value and 'NEXT' in sheet['B10'].value
-    assert '10:30 AM–12:00 PM' in sheet['B10'].value
-    assert '12:00 PM–1:30 PM' in sheet['B10'].value
-    assert 'NEXT' in sheet['B11'].value and 'C101' not in sheet['B11'].value
-    assert all(sheet[f'B{row}'].fill.fgColor.rgb == '00DCE6F1' for row in (9, 10, 11))
-    assert not any(merged.min_col == 2 and merged.min_row <= 11 and merged.max_row >= 9
-                   for merged in sheet.merged_cells.ranges)
+@pytest.mark.parametrize('first,second,winner,merged', [
+    ('10:30-12:00', '12:00-13:30', 'NEXT', None),  # X only in A; Y only in B; C empty.
+    ('10:00-12:30', '12:30-14:30', 'C101', 'B9:B10'),  # Shared band: 60 vs 30 minutes.
+    ('10:30-12:15', '12:15-14:30', 'C101', 'B9:B10'),  # 45/45: earlier class wins.
+])
+def test_shared_band_favors_longest_occupant_and_merges_continuations(first, second, winner, merged):
+    sheet = build([entry(**{'Days': 'M', 'Time (24 Hrs)': first}),
+                   entry(id=2, **{'Days': 'M', 'Course Code': 'NEXT', 'Time (24 Hrs)': second})])['ROOM']
+    if merged:
+        assert merged in set(map(str, sheet.merged_cells.ranges))
+    # Resolve the merged cell covering the shared 11:30 AM–1 PM band.
+    anchor = next((area.start_cell.coordinate for area in sheet.merged_cells.ranges if 'B10' in area), 'B10')
+    assert winner in sheet[anchor].value
+    other = 'C101' if winner == 'NEXT' else 'NEXT'
+    assert other not in sheet[anchor].value
+    assert values(sheet).count('C101') == values(sheet).count('NEXT') == 1
+    if merged is None:
+        assert sheet['B11'].value is None  # Y's 30-minute tail must not occupy block C.
+    expected_times = {
+        '10:30-12:00': '10:30 AM–12:00 PM', '12:00-13:30': '12:00 PM–1:30 PM',
+        '10:00-12:30': '10:00 AM–12:30 PM', '12:30-14:30': '12:30 PM–2:30 PM',
+        '10:30-12:15': '10:30 AM–12:15 PM', '12:15-14:30': '12:15 PM–2:30 PM',
+    }
+    assert expected_times[first] in values(sheet) and expected_times[second] in values(sheet)
+    assert all(sheet[f'B{row}'].fill.fgColor.rgb == '00DCE6F1' for row in (9, 10, 11) if sheet[f'B{row}'].value)
 
 
-def test_irregular_long_meeting_merges_touched_bands_but_preserves_exact_times():
+def test_minority_class_with_no_other_band_is_never_hidden():
+    sheet = build([entry(**{'Days': 'M', 'Time (24 Hrs)': '10:00-12:50'}),
+                   entry(id=2, **{'Days': 'M', 'Course Code': 'SHORT', 'Time (24 Hrs)': '12:50-13:00'})])['ROOM']
+    assert 'C101' in sheet['B10'].value and 'SHORT' in sheet['B10'].value
+    assert '12:50 PM–1:00 PM' in sheet['B10'].value
+    assert sheet['B10'].fill.fgColor.rgb == '00DCE6F1'
+
+
+def test_dominance_never_hides_a_real_overlap_even_when_both_classes_have_other_bands():
+    sheet = build([entry(**{'Days': 'M', 'Time (24 Hrs)': '10:00-13:00'}),
+                   entry(id=2, **{'Days': 'M', 'Course Code': 'CONFLICT', 'Time (24 Hrs)': '12:30-14:30'})])['ROOM']
+    assert 'C101' in sheet['B10'].value and 'CONFLICT' in sheet['B10'].value
+    assert sheet['B10'].fill.fgColor.rgb == '00FCE4D6'
+    assert 'CONFLICT' in sheet['B11'].value
+
+
+def test_chain_of_shared_bands_keeps_every_meeting_and_is_independent_of_input_order():
+    entries = [entry(**{'Days': 'M', 'Time (24 Hrs)': '10:00-11:45'}),
+               entry(id=2, **{'Days': 'M', 'Course Code': 'MIDDLE', 'Time (24 Hrs)': '11:45-13:15'}),
+               entry(id=3, **{'Days': 'M', 'Course Code': 'LAST', 'Time (24 Hrs)': '13:15-14:30'})]
+    sheet = build(entries)['ROOM']
+    assert 'C101' in sheet['B9'].value and 'MIDDLE' not in sheet['B9'].value
+    assert 'MIDDLE' in sheet['B10'].value and 'C101' not in sheet['B10'].value
+    assert 'LAST' in sheet['B11'].value and 'MIDDLE' not in sheet['B11'].value
+    assert values(sheet) == values(build(list(reversed(entries)))['ROOM'])
+
+
+def test_irregular_long_meeting_merges_majority_bands_but_preserves_exact_times():
     sheet = build([entry(**{'Days': 'M', 'Time (24 Hrs)': '09:00-12:00'})])['ROOM']
-    assert 'B8:B10' in set(map(str, sheet.merged_cells.ranges))
+    assert 'B8:B9' in set(map(str, sheet.merged_cells.ranges))
     assert '9:00 AM–12:00 PM' in sheet['B8'].value
-    assert sheet['B7'].value is None and sheet['B11'].value is None
+    assert sheet['B7'].value is None and sheet['B10'].value is None and sheet['B11'].value is None
+
+
+def test_class_split_equally_between_two_bands_uses_earlier_band_once():
+    sheet = build([entry(**{'Days': 'M', 'Time (24 Hrs)': '07:45-09:15'})])['ROOM']
+    assert '7:45 AM–9:15 AM' in sheet['B7'].value
+    assert sheet['B8'].value is None
+    assert values(sheet).count('C101') == 1
 
 
 def test_empty_bands_between_meetings_stay_empty_and_order_is_chronological():
@@ -188,7 +236,7 @@ def test_tba_invalid_or_unavailable_assignments_are_listed_separately():
 def test_empty_room_catalog_safe_text_and_sheet_name_collisions():
     assert build([], rooms=[])['ROOM']['B7'].value == 'No rooms to export.'
     book = build([entry(**{'Course Code': '=HYPERLINK("bad")'})], institution='=1+1')
-    assert book['ROOM']['A1'].data_type == 's' and book['ROOM']['B7'].data_type == 's'
+    assert book['ROOM']['A1'].data_type == 's' and book['ROOM']['B8'].data_type == 's'
     book.create_sheet('Room TBA')
     room_schedule.append_sheets(book, ROOMS, [entry(**{'Days': 'TBA'})], '2026')
     assert 'ROOM (2)' in book.sheetnames and 'Room TBA (2)' in book.sheetnames
