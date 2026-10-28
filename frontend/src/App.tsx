@@ -3505,9 +3505,21 @@ export default function App({ readOnly = false, activeProgram = "", isAdmin = fa
                   </div>
                   <div
                     className="timetable-grid"
-                    onDragOver={(event) => event.preventDefault()}
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                      // Time labels and grid background are not meeting destinations.
+                      // Clear the previous slot so a drop cannot move to a stale target.
+                      if (!(event.target instanceof Element) || !event.target.closest(".cell, .block:not(.preview)")) {
+                        setDragTarget(null);
+                      }
+                    }}
                     onDrop={(event) => {
                       event.preventDefault();
+                      if (event.target instanceof Element && event.target.closest(".time-cell")) {
+                        setDragging(null);
+                        setDragTarget(null);
+                        return;
+                      }
                       handleDrop(id);
                     }}
                     style={{

@@ -177,6 +177,49 @@ test('cross-pane drag reassigns the dragged meeting and Undo restores both panes
   assert.equal(await left.locator('.block').count(), 2);
 });
 
+test('room view moves one meeting within a room and Undo restores it', async t => {
+  const { page, left, moves, entries } = await fixture(t);
+  await left.getByRole('tab', { name: 'Room', exact: true }).click();
+  await left.locator('.block').first().dragTo(left.locator('[data-day="T"][data-slot="480"]'));
+  await page.getByText('Class moved', { exact: true }).waitFor();
+  assert.equal(moves.length, 1);
+  assert.equal(moves[0].assignment, null);
+  const moved = entries().find(entry => entry.id === 3);
+  assert.equal(moved.Room, 'R1');
+  assert.equal(moved.Days, 'T');
+  assert.equal(moved['Time (24 Hrs)'], '08:00-09:00');
+  assert.equal(entries().find(entry => entry.id === 1).Days, 'W');
+  await waitFor(page, () => !document.querySelector('[aria-label="left schedule"] .pane-toolbar > button').disabled);
+  await page.keyboard.press('Control+z');
+  await waitFor(page, () => document.querySelectorAll('[aria-label="left schedule"] [data-entry-id="1"]').length === 2);
+  assert.equal(entries().length, 2);
+});
+
+test('dragging between room panes changes only the dragged meeting room', async t => {
+  const { page, left, right, moves, entries } = await fixture(t);
+  await left.getByRole('tab', { name: 'Room', exact: true }).click();
+  await right.getByRole('tab', { name: 'Room', exact: true }).click();
+  await right.getByLabel('Select room').selectOption('R2');
+  await left.locator('.block').first().dragTo(right.locator('[data-day="T"][data-slot="480"]'));
+  await page.getByText('Class moved', { exact: true }).waitFor();
+  assert.deepEqual(moves[0].assignment, { kind: 'room', name: 'R2' });
+  assert.equal(entries().find(entry => entry.id === 3).Room, 'R2');
+  assert.equal(entries().find(entry => entry.id === 1).Room, 'R1');
+});
+
+test('room view ignores a drop on the time labels after hovering a valid slot', async t => {
+  const { left, moves } = await fixture(t);
+  await left.getByRole('tab', { name: 'Room', exact: true }).click();
+  await left.locator('.block').first().dispatchEvent('dragstart');
+  await left.locator('[data-day="T"][data-slot="480"]').dispatchEvent('dragover');
+  await left.locator('.block.preview').waitFor();
+  const label = left.locator('.time-cell').first();
+  await label.dispatchEvent('dragover');
+  await label.dispatchEvent('drop');
+  assert.equal(moves.length, 0, 'Time labels must not reuse the last hovered day and time');
+  assert.equal(await left.locator('.block.preview').count(), 0);
+});
+
 test('linked scrolling aligns times at different zoom levels; horizontal scrolling stays independent', async t => {
   const { page, left, right } = await fixture(t);
   await page.setViewportSize({ width: 1100, height: 1000 });
