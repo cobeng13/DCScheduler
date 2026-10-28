@@ -39,9 +39,9 @@ def test_overview_pairs_days_in_ninety_minute_bands_and_keeps_exact_times():
     mon = book['ROOM']
     assert [cell.value for cell in mon[6]] == ['Time', 'MON\nR1', 'MON\nR2', 'Time', 'WED\nR1', 'WED\nR2']
     assert mon.max_row == 37
-    assert mon['A7'].value == '7:00 AM–8:30 AM' and mon['A15'].value == '7:00 PM–8:30 PM'
+    assert mon['A7'].value == '7-8:30' and mon['A15'].value == '7-8:30'
     assert mon['B7'].value is None
-    assert mon['B8'].value == 'C101\nA (P1)\n8:00 AM–9:30 AM\nF1'
+    assert mon['B8'].value == 'C101\nA\n8-9:30\nF1'
     assert mon['E8'].value == mon['B8'].value
     assert [mon.cell(row, 2).value for row in (17, 28)] == ['TUE\nR1', 'FRI\nR1']
     assert [mon.cell(row, 5).value for row in (17, 28)] == ['THU\nR1', 'SAT\nR1']
@@ -56,7 +56,8 @@ def test_shared_rooms_include_foreign_programs_and_selected_room_ids(clients, en
         'Faculty': 'F2', 'Time (LPU Std)': '10:00a-11:00a'}).status_code == 200
     sheet = download(clients['alpha'], room_ids=[1])['ROOM']
     assert sheet.max_column == 4
-    assert 'A (P1)' in values(sheet) and 'A (P2)' in values(sheet) and 'FOREIGN' in values(sheet)
+    assert 'C101' in values(sheet) and 'FOREIGN' in values(sheet)
+    assert '(P1)' not in values(sheet) and '(P2)' not in values(sheet)
     assert 'FOREIGN' not in values(download(clients['alpha'], room_ids=[2])['ROOM'])
     # Export is a view operation, not restricted to a program's assigned editor.
     assert 'C101' in values(download(clients['beta'])['ROOM'])
@@ -84,7 +85,7 @@ def test_quarter_hour_meetings_are_preserved_without_false_conflict():
     book = build([entry(**{'Days': 'M', 'Time (24 Hrs)': '07:00-07:15'}),
                   entry(id=2, **{'Days': 'M', 'Course Code': 'NEXT', 'Time (24 Hrs)': '07:15-07:30'})])
     cell = book['ROOM']['B7']
-    assert 'C101' in cell.value and 'NEXT' in cell.value and '7:15 AM' in cell.value
+    assert 'C101' in cell.value and 'NEXT' in cell.value and '7:15' in cell.value
     assert cell.fill.fgColor.rgb == '00DCE6F1'
     assert 'Room TBA' not in book.sheetnames
 
@@ -99,7 +100,7 @@ def test_shared_band_favors_longest_occupant_and_merges_continuations(first, sec
                    entry(id=2, **{'Days': 'M', 'Course Code': 'NEXT', 'Time (24 Hrs)': second})])['ROOM']
     if merged:
         assert merged in set(map(str, sheet.merged_cells.ranges))
-    # Resolve the merged cell covering the shared 11:30 AM–1 PM band.
+    # Resolve the merged cell covering the shared 11:30-1 PM band.
     anchor = next((area.start_cell.coordinate for area in sheet.merged_cells.ranges if 'B10' in area), 'B10')
     assert winner in sheet[anchor].value
     other = 'C101' if winner == 'NEXT' else 'NEXT'
@@ -108,9 +109,9 @@ def test_shared_band_favors_longest_occupant_and_merges_continuations(first, sec
     if merged is None:
         assert sheet['B11'].value is None  # Y's 30-minute tail must not occupy block C.
     expected_times = {
-        '10:30-12:00': '10:30 AM–12:00 PM', '12:00-13:30': '12:00 PM–1:30 PM',
-        '10:00-12:30': '10:00 AM–12:30 PM', '12:30-14:30': '12:30 PM–2:30 PM',
-        '10:30-12:15': '10:30 AM–12:15 PM', '12:15-14:30': '12:15 PM–2:30 PM',
+        '10:30-12:00': '10:30-12', '12:00-13:30': '12-1:30',
+        '10:00-12:30': '10-12:30', '12:30-14:30': '12:30-2:30',
+        '10:30-12:15': '10:30-12:15', '12:15-14:30': '12:15-2:30',
     }
     assert expected_times[first] in values(sheet) and expected_times[second] in values(sheet)
     assert all(sheet[f'B{row}'].fill.fgColor.rgb == '00DCE6F1' for row in (9, 10, 11) if sheet[f'B{row}'].value)
@@ -120,7 +121,7 @@ def test_minority_class_with_no_other_band_is_never_hidden():
     sheet = build([entry(**{'Days': 'M', 'Time (24 Hrs)': '10:00-12:50'}),
                    entry(id=2, **{'Days': 'M', 'Course Code': 'SHORT', 'Time (24 Hrs)': '12:50-13:00'})])['ROOM']
     assert 'C101' in sheet['B10'].value and 'SHORT' in sheet['B10'].value
-    assert '12:50 PM–1:00 PM' in sheet['B10'].value
+    assert '12:50-1' in sheet['B10'].value
     assert sheet['B10'].fill.fgColor.rgb == '00DCE6F1'
 
 
@@ -146,13 +147,13 @@ def test_chain_of_shared_bands_keeps_every_meeting_and_is_independent_of_input_o
 def test_irregular_long_meeting_merges_majority_bands_but_preserves_exact_times():
     sheet = build([entry(**{'Days': 'M', 'Time (24 Hrs)': '09:00-12:00'})])['ROOM']
     assert 'B8:B9' in set(map(str, sheet.merged_cells.ranges))
-    assert '9:00 AM–12:00 PM' in sheet['B8'].value
+    assert '9-12' in sheet['B8'].value
     assert sheet['B7'].value is None and sheet['B10'].value is None and sheet['B11'].value is None
 
 
 def test_class_split_equally_between_two_bands_uses_earlier_band_once():
     sheet = build([entry(**{'Days': 'M', 'Time (24 Hrs)': '07:45-09:15'})])['ROOM']
-    assert '7:45 AM–9:15 AM' in sheet['B7'].value
+    assert '7:45-9:15' in sheet['B7'].value
     assert sheet['B8'].value is None
     assert values(sheet).count('C101') == 1
 
@@ -185,12 +186,12 @@ def test_print_areas_keep_days_and_room_chunks_separate():
 def test_midnight_clips_bands_without_shifting_the_seven_am_anchor():
     sheet = build([entry(**{'Days': 'M', 'Time (24 Hrs)': '00:00-01:15'}),
                    entry(id=2, **{'Days': 'M', 'Course Code': 'LATE', 'Time (24 Hrs)': '23:30-24:00'})])['ROOM']
-    assert sheet['A7'].value == '12:00 AM–1:00 AM'
-    assert sheet['A8'].value == '1:00 AM–2:30 AM'
-    assert sheet['B7'].value == 'C101\nA (P1)\n12:00 AM–1:15 AM\nF1'
-    assert sheet.cell(sheet.max_row, 1).value == '11:30 PM–12:00 AM'
+    assert sheet['A7'].value == '12-1'
+    assert sheet['A8'].value == '1-2:30'
+    assert sheet['B7'].value == 'C101\nA\n12-1:15\nF1'
+    assert sheet.cell(sheet.max_row, 1).value == '11:30-12'
     assert 'LATE' in values(sheet)
-    assert '7:00 AM–8:30 AM' in values(sheet)
+    assert '7-8:30' in values(sheet)
 
 
 def test_dense_labels_fail_explicitly_instead_of_clipping_or_exceeding_excel_limits():
@@ -215,9 +216,9 @@ def test_boundaries_extend_grid_and_sunday_is_never_dropped():
                   entry(id=2, **{'Days': 'M', 'Time (24 Hrs)': '21:15-22:00'})])
     sheet = book['ROOM']
     assert 'SUN\nR1' in values(sheet)
-    assert sheet['A7'].value == '5:30 AM–7:00 AM'
-    assert '6:15 AM–6:45 AM' in values(book['ROOM'])
-    assert sheet.cell(sheet.max_row, 1).value == '8:30 PM–10:00 PM'
+    assert sheet['A7'].value == '5:30-7'
+    assert '6:15-6:45' in values(book['ROOM'])
+    assert sheet.cell(sheet.max_row, 1).value == '8:30-10'
     assert 'SUN\nR1' in values(build([], include_sunday=True)['ROOM'])
     assert 'SUN\nR1' not in values(build([])['ROOM'])
 
@@ -271,9 +272,9 @@ def test_lpu_fallback_invalid_clock_minutes_and_midnight_are_handled():
     # authoritative 24-hour value ending at midnight for a valid boundary.
     assert 'BAD MINUTES' in values(book['Room TBA'])
     book = build([entry(**{'Days': 'M', 'Time (24 Hrs)': '23:30-24:00'})])
-    assert '11:30 PM–12:00 AM' in values(book['ROOM'])
+    assert '11:30-12' in values(book['ROOM'])
     book = build([entry(**{'Days': 'M', 'Time (24 Hrs)': '', 'Time (LPU Std)': '8:15a-9:00a'})])
-    assert '8:15 AM–9:00 AM' in values(book['ROOM'])
+    assert '8:15-9' in values(book['ROOM'])
 
 
 def test_ignored_rooms_and_their_bookings_are_excluded_from_both_export_paths(clients, entry_payload):

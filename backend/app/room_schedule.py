@@ -29,7 +29,8 @@ def band_end(minute):
 
 
 def clock(minutes):
-    return f'{minutes // 60 % 12 or 12}:{minutes % 60:02d} {"AM" if minutes % 1440 < 720 else "PM"}'
+    hour = minutes // 60 % 12 or 12
+    return f'{hour}:{minutes % 60:02d}' if minutes % 60 else str(hour)
 
 
 def interval(entry):
@@ -58,8 +59,8 @@ def meeting_days(entry):
 
 def label(entry, start, end):
     return '\n'.join([entry.get('Course Code') or 'TBA',
-                      f'{entry.get("Section") or "TBA"} ({entry.get("Program") or "TBA"})',
-                      f'{clock(start)}–{clock(end)}', entry.get('Faculty') or 'TBA'])
+                      entry.get('Section') or 'TBA',
+                      f'{clock(start)}-{clock(end)}', entry.get('Faculty') or 'TBA'])
 
 
 def configure_sheet(sheet, panel_width, title, school_year):
@@ -181,7 +182,7 @@ def append_sheets(workbook, rooms, entries, school_year, institution=DEFAULT_INS
             sheet.row_dimensions[header].height = 36
             for row, (left, right) in enumerate(slots, header + 1):
                 sheet.row_dimensions[row].height = max(sheet.row_dimensions[row].height or 0, 48)
-                cell = write_value(sheet, row, time_column, f'{clock(left)}–{clock(right)}')
+                cell = write_value(sheet, row, time_column, f'{clock(left)}-{clock(right)}')
                 cell.font = Font(name='Arial Narrow', size=10)
                 cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
                 cell.fill = PatternFill('solid', fgColor='F2F5F8')
